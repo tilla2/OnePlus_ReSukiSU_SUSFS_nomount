@@ -23,6 +23,11 @@ inputs:
     required: false
     type: string
     default: ""
+  nomount_commit:
+    description: 'NoMount commit SHA to pin (empty = built-in known-good fallback pin)'
+    required: false
+    type: string
+    default: ""
   build_timestamp:
     description: 'Custom kernel build timestamp shown in uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty to use the current build time.'
     required: false
@@ -887,11 +892,23 @@ runs:
         
         retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
         git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
-        git -C nomount fetch --depth 1 origin 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
-        git -C nomount checkout --detach 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
+        NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
+        if [ -z "$NOMOUNT_TARGET" ]; then
+          NOMOUNT_TARGET="1dacddf5d85ced5b6c26ab09e621e366e4f0cd88"
+          echo "No NoMount commit provided; using built-in known-good pin: $NOMOUNT_TARGET"
+        else
+          echo "Using caller-resolved NoMount commit: $NOMOUNT_TARGET"
+        fi
+        git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+        git -C nomount checkout --detach "$NOMOUNT_TARGET"
         NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+        if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
+          echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+          exit 1
+        fi
+        git -C nomount log --oneline -1
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "Using pinned NoMount dev commit: $NOMOUNT_COMMIT_SHA"
+        echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then

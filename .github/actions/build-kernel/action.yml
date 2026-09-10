@@ -375,6 +375,7 @@ runs:
         echo "MSM_KERNEL_FOLDER=$MSM_KERNEL_DIR" >> "$GITHUB_ENV"
         echo "AK3_FOLDER=$AK3_DIR" >> "$GITHUB_ENV"
         echo "DEBUG_ARTIFACTS_FOLDER=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
+        echo "DEBUG_ARTIFACTS_DIR=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
         echo "KERNEL_PATCHES_FOLDER=$KERNEL_PATCHES_DIR" >> "$GITHUB_ENV"
         echo "SUSFS_FOLDER=$SUSFS_DIR" >> "$GITHUB_ENV"
         echo "NOMOUNT_FOLDER=$NOMOUNT_DIR" >> "$GITHUB_ENV"
@@ -1141,7 +1142,7 @@ runs:
           "v1.5.8")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not apply cleanly (soft-fail, continuing)"
             else
               echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
             fi
@@ -1660,7 +1661,7 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         if [ ! -f block/adios.c ]; then
           ADIOS_FILE="adios_ioscheduler_${KERNEL_VER}.patch"
-          case "${CONFIG_BRANCH:-}" in
+          case "${OP_BRANCH:-}" in
             *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
           esac
           curl -sSL --fail -o /tmp/adios.patch             "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
@@ -1671,7 +1672,6 @@ runs:
             find . -name '*.rej' -newer /tmp/adios.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; || true
             exit 1
           fi
-        fi
         else
           echo "block/adios.c already present, enabling config only"
         fi

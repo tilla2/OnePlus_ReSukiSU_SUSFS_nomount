@@ -289,6 +289,12 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
+        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3; do
+          val="${!bool_opt:-}"
+          if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
+            errors+=("$bool_opt must be true or false if set. Got: '$val'")
+          fi
+        done
         if [ ${#errors[@]} -ne 0 ]; then
           echo "Found ${#errors[@]} validation error(s):" >&2
           for error in "${errors[@]}"; do
@@ -1049,6 +1055,27 @@ runs:
         echo "✅ ReSukiSU added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
+    - name: Add ReSukiSU Root Tag
+      if: ${{ inputs.ksu_type == 'ReSukiSU' && env.OP_ROOT_TAG != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Add ReSukiSU root tag"
+        if ! grep -rq 'config KSU_FULL_NAME_FORMAT' "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Kconfig"; then
+          echo "::warning::ReSukiSU Kconfig has no KSU_FULL_NAME_FORMAT symbol, skipping root tag"
+          echo "::endgroup::"
+          exit 0
+        fi
+        MANAGER_BRANCH="${{ inputs.ksu_branch_or_hash }}"
+        [ -z "$MANAGER_BRANCH" ] && MANAGER_BRANCH="main"
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-${OP_ROOT_TAG}@${MANAGER_BRANCH}[%COMMIT_SHA%]"
+        EOF
+        grep -n 'CONFIG_KSU_FULL_NAME_FORMAT' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        echo "ROOT_TAG_APPLIED=${OP_ROOT_TAG}" >> "$GITHUB_ENV"
+        echo "Root tag applied: ${OP_ROOT_TAG}"
+        echo "::endgroup::"
+
     - name: Apply SUSFS Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
@@ -1093,7 +1120,7 @@ runs:
               echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
             fi
             ;;
-          "v2.2.0")
+          "v2.2.0"|"v2.3.0")
             if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1588,6 +1615,57 @@ runs:
 
         echo "✅ NoMount integration completed"
 
+        echo "::endgroup::"
+
+    - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)
+      if: ${{ env.OP_LZ4_UPGRADE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Upgrade LZ4"
+        cd "$COMMON_KERNEL_FOLDER"
+        if [ -f lib/lz4/lz4.c ] && grep -q 'lib/lz4/lz4.h' include/linux/lz4.h 2>/dev/null; then
+          echo "LZ4 already upgraded, skipping"
+        else
+          rm -rf "$GITHUB_WORKSPACE/lz4_oplus"
+          git clone --depth 1 https://github.com/Numbersf/lz4_oplus.git "$GITHUB_WORKSPACE/lz4_oplus"
+          bash "$GITHUB_WORKSPACE/lz4_oplus/apply_lz4_oplus.sh"
+        fi
+        grep -q 'lib/lz4/lz4.h' include/linux/lz4.h
+        grep -q 'LZ4_arm64_decompress_safe' crypto/lz4.c
+        ls lib/lz4/lz4.c lib/lz4/lz4hc.c lib/lz4/lz4armv8/lz4accel.c > /dev/null
+        echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
+        echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
+        echo "LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+        echo "::endgroup::"
+
+    - name: Enable ADIOS I/O Scheduler
+      if: ${{ env.OP_ADIOS == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Enable ADIOS I/O scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        if [ ! -f block/adios.c ]; then
+          curl -sSL --fail -o /tmp/adios.patch \
+            "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/adios_ioscheduler_${KERNEL_VER}.patch"
+          if ! patch -p1 --forward < /tmp/adios.patch; then
+            echo "::error::ADIOS patch failed for ${KERNEL_VER}"
+            exit 1
+          fi
+        else
+          echo "block/adios.c already present, enabling config only"
+        fi
+        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
+        grep -q 'adios.o' block/Makefile
+        grep -q '^CONFIG_MQ_IOSCHED_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
+        echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
+        echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
+        echo "ADIOS I/O scheduler enabled"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -2103,6 +2181,43 @@ runs:
         CONFIG_NET_SCH_FQ_CODEL=y
         EOF
 
+    - name: Apply BBRv3
+      if: ${{ env.OP_BBR3 == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BBRv3"
+        cd "$COMMON_KERNEL_FOLDER"
+        BBR3_BASE="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
+        MAIN_PATCH="0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch"
+        DEBUGFS_PATCH="0002-net-tcp-bbr3-add-debugfs-diagnostics-and-runtime-tunables.patch"
+        curl -sSL --fail -o /tmp/bbr3_main.patch "$BBR3_BASE/$MAIN_PATCH"
+        curl -sSL --fail -o /tmp/bbr3_debugfs.patch "$BBR3_BASE/$DEBUGFS_PATCH"
+        if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
+          curl -sSL --fail -o /tmp/bbr3_sysctl_add.patch "$BBR3_BASE/sysctl_add_proc_dou8vec_minmax.patch"
+          curl -sSL --fail -o /tmp/bbr3_sysctl_fix.patch "$BBR3_BASE/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch"
+          patch -p1 --forward < /tmp/bbr3_sysctl_add.patch
+          patch -p1 --forward < /tmp/bbr3_sysctl_fix.patch
+        fi
+        if ! patch -p1 --forward < /tmp/bbr3_main.patch; then
+          echo "::error::BBRv3 backport failed for ${ANDROID_VER}-${KERNEL_VER}"
+          exit 1
+        fi
+        patch -p1 --forward < /tmp/bbr3_debugfs.patch
+        grep -q 'config TCP_CONG_BBR3' net/ipv4/Kconfig
+        grep -q 'tcp_bbr3' net/ipv4/Makefile
+        grep -q '^CONFIG_TCP_CONG_BBR=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_NET_SCH_FQ=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_NET_SCH_FQ=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_TCP_CONG_BBR3=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR3=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
+        echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
+        echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
+        echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
+
     - name: Add TTL Target Support
       if: ${{ env.OP_TTL == 'true' }}
       shell: bash
@@ -2407,7 +2522,7 @@ runs:
         
         OPTIONS=()
         
-        if [ "$OP_BBR" = "true" ] || [ "$OP_BBR3" = "true" ]; then
+        if [ "${OP_BBR:-}" = "true" ] || [ "${OP_BBR3:-}" = "true" ]; then
           OPTIONS+=("CONFIG_TCP_CONG_ADVANCED")
         fi
         
@@ -2464,7 +2579,10 @@ runs:
         export SOURCE_DATE_EPOCH=$COMMIT_TIMESTAMP
         if [ -n "${{ inputs.build_timestamp }}" ]; then
           export KBUILD_BUILD_TIMESTAMP="${{ inputs.build_timestamp }}"
-          echo "📅 Using custom build timestamp: $KBUILD_BUILD_TIMESTAMP"
+          echo "📅 Using custom build timestamp input: $KBUILD_BUILD_TIMESTAMP"
+        elif [ -n "${OP_BUILD_TIME:-}" ] && [ "${OP_BUILD_TIME}" != "null" ]; then
+          export KBUILD_BUILD_TIMESTAMP="$OP_BUILD_TIME"
+          echo "📅 Using per-config build_time: $KBUILD_BUILD_TIMESTAMP"
         else
           export KBUILD_BUILD_TIMESTAMP="$KERNEL_BUILD_DATE"
           echo "📅 Using current UTC build timestamp: $KBUILD_BUILD_TIMESTAMP"

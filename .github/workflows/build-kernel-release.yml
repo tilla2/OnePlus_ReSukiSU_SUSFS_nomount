@@ -104,6 +104,11 @@ on:
         required: false
         type: boolean
         default: false
+      apply_bore:
+        description: 'Apply BoRE scheduler patch (all kernel versions)'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   set-op-model:
@@ -514,6 +519,7 @@ jobs:
           - Create Release: ${{ inputs.make_release && '✅ Yes' || '❌ No' }}
           - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
+          - Apply BoRE: ${{ inputs.apply_bore && '✅ Yes' || '❌ No' }}
           
           **SUSFS Configuration:**
           EOF
@@ -963,6 +969,7 @@ jobs:
           clean: ${{ inputs.clean_build }}
           debug: ${{ inputs.debug }}
           patch_dry_run: ${{ inputs.patch_dry_run }}
+          apply_bore: ${{ inputs.apply_bore }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload patch failure forensics
@@ -975,6 +982,7 @@ jobs:
             kernel_workspace/kernel_platform/common/block/*.rej
             kernel_workspace/kernel_platform/common/net/ipv4/*.rej
             kernel_workspace/kernel_platform/common/kernel/*.rej
+            kernel_workspace/kernel_platform/common/kernel/sched/*.rej
           if-no-files-found: ignore
 
       - name: 📊 Build statistics

@@ -19,7 +19,7 @@
   "ds": true,
   "bbg": true,
   "bbr": true,
-  "bbr3": false,
+  "bbr3": true,
   "lz4_upgrade": true,
   "adios": true,
   "ttl": true,

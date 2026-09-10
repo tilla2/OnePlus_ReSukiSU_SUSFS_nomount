@@ -1183,8 +1183,8 @@ jobs:
           # build-time helper and must never become a release asset, so drop it
           # before notes generation / asset upload. The ccache download-once
           # mechanism (prepare_ccache job + ccache-binary artifact) is untouched.
-          find ./downloaded-artifacts -maxdepth 2 -type f -name ccache -delete
-          rm -rf ./downloaded-artifacts/ccache-binary
+          rm -f ./downloaded-artifacts/ccache*
+          ls -A ./downloaded-artifacts
           echo "✅ ccache binary excluded from release staging"
 
       - name: 📦 Fetch verified companion downloads
@@ -1238,6 +1238,7 @@ jobs:
               "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
               "NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
               "453daaf7312a9eb66e05d3dd06d9ef364265e87b0ed619db890601dab767e169"
+              echo "NM_MODULE_NAME=NoMount-v1.1.1-dev-1dacddf-ReSukiSU" >> "$GITHUB_ENV"
           else
             echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
             MODULE_ZIP="$(find . -maxdepth 1 -name 'NoMount-*.zip' | head -n1)"
@@ -1260,19 +1261,11 @@ jobs:
           sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
 
       - name: 📤 Upload NoMount module to run artifacts (raw, not re-zipped)
+        if: env.NM_BUILT != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: nomount-module
           path: ./downloaded-artifacts/NoMount-*.zip
-          archive: false
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: 📤 Upload NoMount module checksum to run artifacts (raw, not re-zipped)
-        uses: actions/upload-artifact@v7
-        with:
-          name: nomount-module-sha256
-          path: ./downloaded-artifacts/NoMount-*.zip.sha256
           archive: false
           if-no-files-found: error
           retention-days: 7

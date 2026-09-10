@@ -832,7 +832,7 @@ runs:
               
               echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
               rm -rf "$repo_name" "$shm_path" 2>/dev/null
-              sleep $((attempt * 15))
+              [ $attempt -lt $max_attempts ] && sleep $((attempt * 15))
               attempt=$((attempt + 1))
           done
           

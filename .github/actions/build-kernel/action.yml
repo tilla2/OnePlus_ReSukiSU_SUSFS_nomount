@@ -816,7 +816,12 @@ runs:
           while [ $attempt -le $max_attempts ]; do
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
               
-              if aria2c -x16 -s16 -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+              local aria_splits="-x16 -s16 -j16"
+          if [[ "$url" == *"gitlab.com"* ]]; then
+            # GitLab throttles per-IP bursts; 16-way segmentation invites 429s
+            aria_splits="-x4 -s4"
+          fi
+          if aria2c $aria_splits -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
                   mkdir -p "$repo_name"
                   if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
                       echo "✅ Success: $repo_name synced"
@@ -827,7 +832,7 @@ runs:
               
               echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
               rm -rf "$repo_name" "$shm_path" 2>/dev/null
-              sleep 5
+              sleep $((attempt * 15))
               attempt=$((attempt + 1))
           done
           
@@ -912,8 +917,15 @@ runs:
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
-            echo "::error::Failed to fetch SUSFS archive after multiple attempts"
-            exit 1
+            echo "::warning::SUSFS archive fetch throttled; falling back to a plain git clone"
+            rm -rf "$SUSFS_FOLDER"
+            if git clone --no-checkout "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_FOLDER" \
+               && git -C "$SUSFS_FOLDER" checkout --detach "$SUSFS_BRANCH"; then
+              echo "SUSFS tree fetched via git clone fallback at $SUSFS_BRANCH"
+            else
+              echo "::error::Failed to fetch SUSFS after both archive and git-clone attempts"
+              exit 1
+            fi
           fi
           echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> $GITHUB_ENV
         fi

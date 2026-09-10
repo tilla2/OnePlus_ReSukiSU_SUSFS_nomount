@@ -91,6 +91,14 @@ on:
         description: 'Enter SusFS Branch or commit hash for android16-6.12'
         type: string
         default: ''
+      nomount_branch:
+        description: 'NoMount branch to track for auto resolution (used when no commit is given)'
+        type: string
+        default: 'dev'
+      nomount_commit:
+        description: 'NoMount commit SHA to pin (empty = auto: latest commit whose own CI built a module)'
+        type: string
+        default: ''
 
 jobs:
   set-op-model:
@@ -552,6 +560,112 @@ jobs:
             echo "> **⚠️ Android-Kernel Filter:** Only OOS15 and OOS16 devices will be built for \`${{ inputs.op_model }}\`" >> $GITHUB_STEP_SUMMARY
           fi
 
+  resolve-nomount:
+    name: Resolve NoMount commit (locked for all kernels)
+    runs-on: ubuntu-latest
+    outputs:
+      nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
+      nomount_source: ${{ steps.resolve.outputs.nomount_source }}
+      nomount_module_name: ${{ steps.resolve.outputs.nomount_module_name }}
+      nomount_artifact_id: ${{ steps.resolve.outputs.nomount_artifact_id }}
+      nomount_run_url: ${{ steps.resolve.outputs.nomount_run_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 🔍 Resolve NoMount commit and matching CI module
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Resolve NoMount commit"
+          FALLBACK_PIN="1dacddf5d85ced5b6c26ab09e621e366e4f0cd88"
+          branch="${{ inputs.nomount_branch }}"
+          commit="${{ inputs.nomount_commit }}"
+
+          # find_module_for <sha>: locate the successful "build module" CI run for
+          # exactly this SHA and its live module artifact (name carries the short
+          # hash of that commit; the intermediate "module-base" artifact is skipped).
+          find_module_for() {
+            local sha="$1" short7 run_id art
+            short7="${sha:0:7}"
+            MODULE_ID=""; MODULE_NAME=""; NM_RUN_URL=""
+            run_id=$(gh api "repos/maxsteeel/nomount/actions/runs?head_sha=$sha&status=success&per_page=10" \
+              --jq '[.workflow_runs[] | select(.path | endswith("build.yml"))][0].id // empty' 2>/dev/null || true)
+            [ -n "$run_id" ] || return 1
+            NM_RUN_URL=$(gh api "repos/maxsteeel/nomount/actions/runs/$run_id" --jq '.html_url')
+            art=$(gh api "repos/maxsteeel/nomount/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false and .name != "module-base" and (.name | contains("-'"$short7"'")))][0] | "\(.id)|\(.name)"' 2>/dev/null || true)
+            [ -n "$art" ] || return 1
+            MODULE_ID="${art%%|*}"
+            MODULE_NAME="${art#*|}"
+            return 0
+          }
+
+          module_name=""; module_id=""; run_url=""
+
+          if [ -n "$commit" ]; then
+            # ── Mode 1: explicit commit ──
+            if ! [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::nomount_commit must be a full 40-char SHA, got: '$commit'"
+              exit 1
+            fi
+            if ! gh api "repos/maxsteeel/nomount/commits/$commit" --jq '.sha' >/dev/null 2>&1; then
+              echo "::error::nomount_commit '$commit' does not exist in maxsteeel/nomount"
+              exit 1
+            fi
+            echo "📌 Explicit NoMount commit: $commit"
+            src="explicit-commit"
+            if find_module_for "$commit"; then
+              module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
+              echo "✅ Exact CI-built module found: $module_name"
+            else
+              echo "::error::No live NoMount module artifact for explicit commit $commit. A bundleable module needs a successful 'build module' CI run with unexpired artifacts for exactly this SHA. Pick a CI-verified commit or leave both inputs empty for auto mode."
+              exit 1
+            fi
+          else
+            # ── Mode 2: auto — newest commit on <branch> whose own CI built a module ──
+            mapfile -t candidates < <(gh api "repos/maxsteeel/nomount/actions/runs?branch=$branch&status=success&per_page=20" \
+              --jq '[.workflow_runs[] | select(.path | endswith("build.yml"))][0:10][].head_sha' 2>/dev/null || true)
+            for sha in "${candidates[@]:-}"; do
+              [ -z "$sha" ] && continue
+              if find_module_for "$sha"; then
+                commit="$sha"
+                module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
+                src="latest-ci-success-$branch"
+                echo "🔀 Latest CI-verified commit on '$branch': $commit (module: $module_name)"
+                break
+              fi
+            done
+            # ── Mode 3: fallback — known-good pin, static verified ZIP ──
+            if [ -z "$commit" ]; then
+              echo "::warning::No CI-verified NoMount module found on branch '$branch'. Falling back to known-good pinned commit."
+              commit="$FALLBACK_PIN"
+              src="fallback-known-good-pin"
+            fi
+          fi
+
+          {
+            echo "nomount_commit=$commit"
+            echo "nomount_source=$src"
+            echo "nomount_module_name=$module_name"
+            echo "nomount_artifact_id=$module_id"
+            echo "nomount_run_url=$run_url"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 🚫 NoMount Resolution"
+            echo ""
+            echo "**Commit:** \`$commit\` ($src) — locked for **all** matrix builds in this run."
+            if [ -n "$module_name" ]; then
+              echo ""
+              echo "**Userspace module:** \`$module_name.zip\` — exact CI build for this commit, bundled into the release."
+            else
+              echo ""
+              echo "**Userspace module:** pinned static ZIP (matches \`1dacddf\`)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+          
   mirror_toolchain:
     needs: set-op-model
     if: ${{ inputs.mirror_toolchains }}
@@ -598,10 +712,11 @@ jobs:
 
   build:
     name: build (${{ matrix.model }}, ${{ matrix.soc }}, ${{ matrix.branch }}, ${{ matrix.manifest }}, ${{ matrix.android_version }}, ${{ matrix.kernel_version }}, ${{ matrix.os_version }}, ${{ matrix.ksu_type }})
-    needs: [set-op-model, mirror_toolchain, prepare_ccache]
+    needs: [set-op-model, resolve-nomount, mirror_toolchain, prepare_ccache]
     if: |
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
+      needs.resolve-nomount.result == 'success' &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
@@ -715,6 +830,7 @@ jobs:
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
           optimize_level: ${{ inputs.optimize_level }}
           build_timestamp: ${{ inputs.build_timestamp }}
           clean: ${{ inputs.clean_build }}
@@ -865,17 +981,23 @@ jobs:
           echo "::endgroup::"
 
   trigger-release:
-    needs: [set-op-model, build]
+    needs: [set-op-model, resolve-nomount, build]
     runs-on: ubuntu-latest
     if: |
       !cancelled() &&
       inputs.make_release == true &&
-      needs.set-op-model.result == 'success'
+      needs.set-op-model.result == 'success' &&
+      needs.resolve-nomount.result == 'success'
     env:
       REPO_OWNER: ${{ github.repository_owner }}
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
+      NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
+      NM_MODE: ${{ needs.resolve-nomount.outputs.nomount_source }}
+      NM_MODULE_NAME: ${{ needs.resolve-nomount.outputs.nomount_module_name }}
+      NM_ARTIFACT_ID: ${{ needs.resolve-nomount.outputs.nomount_artifact_id }}
+      NM_RUN_URL: ${{ needs.resolve-nomount.outputs.nomount_run_url }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v6
@@ -987,12 +1109,45 @@ jobs:
                 "1417081413bf7ab1de8e440ecbcb62685037c8f28f048f0f8b79e305b31ab916"
               ;;
           esac
-          download_and_verify \
-            "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
-            "NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
-            "453daaf7312a9eb66e05d3dd06d9ef364265e87b0ed619db890601dab767e169"
+          if [ "$NM_SHA" = "1dacddf5d85ced5b6c26ab09e621e366e4f0cd88" ]; then
+            download_and_verify \
+              "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
+              "NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
+              "453daaf7312a9eb66e05d3dd06d9ef364265e87b0ed619db890601dab767e169"
+          else
+            [ -n "$NM_MODULE_NAME" ] || { echo "::error::resolve-nomount produced no module name for a non-pinned commit"; exit 1; }
+            echo "NoMount resolved to $NM_SHA ($NM_MODE) — fetching the exact CI-built module: $NM_MODULE_NAME"
+            MODULE_STAGE="$RUNNER_TEMP/nomount-module-stage"
+            rm -rf "$MODULE_STAGE" && mkdir -p "$MODULE_STAGE"
+            curl --fail --location --retry 3 --retry-delay 5 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --output "$RUNNER_TEMP/nomount-artifact.zip" \
+              "https://api.github.com/repos/maxsteeel/nomount/actions/artifacts/$NM_ARTIFACT_ID/zip"
+            unzip -q "$RUNNER_TEMP/nomount-artifact.zip" -d "$MODULE_STAGE"
+            if [ ! -f "$MODULE_STAGE/module.prop" ]; then
+              inner="$(find "$MODULE_STAGE" -maxdepth 2 -name module.prop | head -n1)"
+              [ -n "$inner" ] && mv "$(dirname "$inner")"/* "$MODULE_STAGE"/
+            fi
+            [ -f "$MODULE_STAGE/module.prop" ] || { echo "::error::Downloaded NoMount artifact has no module.prop at module root; refusing to bundle a broken module."; exit 1; }
+            echo "module.prop name/version line:"
+            grep -E '^(name|version)=' "$MODULE_STAGE/module.prop"
+            ls -l "$MODULE_STAGE/bin/" | grep -E 'nm-arm64|lkmloader-arm64' || echo "::warning::nm/lkmloader binaries not found in module bin/ — verify manually"
+            (cd "$MODULE_STAGE" && zip -qr9 "$RUNNER_TEMP/$NM_MODULE_NAME.zip" .)
+            mv "$RUNNER_TEMP/$NM_MODULE_NAME.zip" ./
+            unzip -t "$NM_MODULE_NAME.zip" > /dev/null && echo "✅ module zip integrity OK"
+            ls -la "$NM_MODULE_NAME.zip"
+            sha256sum "$NM_MODULE_NAME.zip"
+          fi
           sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
 
+      - name: 📦 Upload NoMount module to run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nomount-module
+          path: ./downloaded-artifacts/NoMount-*.zip
+          if-no-files-found: error
+          retention-days: 7
+          
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
         run: |
@@ -1196,11 +1351,34 @@ jobs:
           $(for key in "${active_gki_keys[@]}"; do
             echo "| $key | \`${susfs_map[$key]:-unknown}\` |"
           done)
-          
+          EOF
+
+          ### 📌 NoMount Integration
+
+          | Component | Value |
+          |-----------|-------|
+          | Kernel-side commit | [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) — $NM_MODE, locked for all kernels in this run |
+
+          EOF
+
+          if [ -n "$NM_MODULE_NAME" ]; then
+            cat << EOF >> release_notes.md
+          | Userspace module | [\`$NM_MODULE_NAME.zip\`](https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${NEW_TAG}/${NM_MODULE_NAME}.zip) — built by nomount CI from exactly this commit |
+          | Module CI build | [$NM_RUN_URL]($NM_RUN_URL) |
+          EOF
+          else
+            cat << EOF >> release_notes.md
+          | Userspace module | \`NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip\` — pinned verified build ([source release](https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/tag/nomount-dev-20260809)) |
+          EOF
+          fi
+
+          cat << EOF >> release_notes.md
+          > The bundled module ZIP always matches the kernel-side NoMount commit above — kernel and userspace can never drift within a release.
+
           ---
-          
+
           ## ✨ Features & Capabilities
-          
+
           ### 🔐 Root Management
           EOF
           if [ "$ksu_type" == "KSUN" ]; then
@@ -1218,7 +1396,7 @@ jobs:
           fi
           cat << EOF >> release_notes.md
           - **SUSFS $SUSFS_BASE_VERSION** - Advanced hiding and security features
-          - **NoMount** - Integrated from the configured MaxSteel NoMount dev revision
+          - **NoMount** - Kernel-side integration from [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
           EOF
           
           if [ "${ksu_ver_global:-0}" -lt 12884 ]; then

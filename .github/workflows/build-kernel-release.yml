@@ -33,7 +33,7 @@ on:
         description: 'Optional exact config path for a single-device validation build (for example configs/oos16/OP-ACE-2.json)'
         required: false
         type: string
-        default: ''
+        default: 'configs/oos16/OP15.json'
       ksu_type:
         description: 'Select KSU Type'
         required: true
@@ -42,11 +42,11 @@ on:
           - KSUN
           - ReSukiSU
           - KSU
-        default: KSUN
+        default: ReSukiSU
       ksu_branch_or_hash:
         description: 'KSU branch or commit hash'
         type: string
-        default: 'v3.3.0'
+        default: 'main'
       optimize_level:
         description: "Compiler optimization level"
         required: true

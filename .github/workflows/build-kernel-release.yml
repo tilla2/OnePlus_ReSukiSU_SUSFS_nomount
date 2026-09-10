@@ -99,6 +99,11 @@ on:
         description: 'NoMount commit SHA to pin (empty = auto: latest commit whose own CI built a module)'
         type: string
         default: ''
+      patch_dry_run:
+        description: 'Patch verification mode: apply every patch, upload a verdict per device, skip compilation'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   set-op-model:
@@ -957,7 +962,20 @@ jobs:
           build_timestamp: ${{ inputs.build_timestamp }}
           clean: ${{ inputs.clean_build }}
           debug: ${{ inputs.debug }}
+          patch_dry_run: ${{ inputs.patch_dry_run }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload patch failure forensics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-faillogs-${{ matrix.model }}
+          path: |
+            patch-faillogs/
+            kernel_workspace/kernel_platform/common/block/*.rej
+            kernel_workspace/kernel_platform/common/net/ipv4/*.rej
+            kernel_workspace/kernel_platform/common/kernel/*.rej
+          if-no-files-found: ignore
 
       - name: 📊 Build statistics
         id: build-stat

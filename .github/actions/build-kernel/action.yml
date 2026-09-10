@@ -1564,74 +1564,52 @@ runs:
 
         cd "$COMMON_KERNEL_FOLDER"
 
-        echo "Copying NoMount source..."
-        cp -av "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/"
+        echo "Installing NoMount Kbuild package at fs/nomount/..."
+        rm -rf "$COMMON_KERNEL_FOLDER/fs/nomount"
+        mkdir -p "$COMMON_KERNEL_FOLDER/fs/nomount"
+        cp -a "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.c" ]; then
-          echo "::error::nomount.c was not copied successfully"
-          exit 1
-        fi
-
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.h" ]; then
-          echo "::error::nomount.h was not copied successfully"
-          exit 1
-        fi
-
-        echo "✅ NoMount source copied"
-
-        echo "Listing NoMount kernel directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel"
-
-        echo ""
-        echo "Listing NoMount patches directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel/patches"
-
-        echo ""
-        echo "Available NoMount patches:"
-        find "$NOMOUNT_FOLDER/kernel/patches" -maxdepth 1 -type f -name "*.patch" | sort
-
-        case "$KERNEL_VER" in
-          5.10|5.15|6.1|6.6|6.12)
-            NOMOUNT_PATCH="$NOMOUNT_FOLDER/kernel/patches/nomount_${KERNEL_VER}_kernel_integration.patch"
-            ;;
-          *)
-            echo "::error::Unsupported NoMount kernel version: $KERNEL_VER"
+        for f in nomount.c nomount.h Kconfig Makefile; do
+          if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount/$f" ]; then
+            echo "::error::fs/nomount/$f missing after copy"
             exit 1
-            ;;
-        esac
+          fi
+        done
+        echo "✅ NoMount source installed"
 
-        echo ""
-        echo "Using NoMount patch:"
-        echo "$NOMOUNT_PATCH"
-
-        if [ ! -f "$NOMOUNT_PATCH" ]; then
-          echo "::error::NoMount patch not found: $NOMOUNT_PATCH"
-          exit 1
+        if ! grep -q "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"; then
+          printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$COMMON_KERNEL_FOLDER/fs/Makefile"
+          echo "➕ fs/Makefile wired"
         fi
 
-        echo "Applying NoMount patch..."
-
-        if ! patch -p1 --forward < "$NOMOUNT_PATCH"; then
-          echo "::error::NoMount patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
+        if ! grep -q 'source "fs/nomount/Kconfig"' "$COMMON_KERNEL_FOLDER/fs/Kconfig"; then
+          awk '
+            /^endmenu/ { last_match = NR }
+            { lines[NR] = $0 }
+            END {
+              for (i = 1; i <= NR; i++) {
+                if (i == last_match) print "source \"fs/nomount/Kconfig\""
+                print lines[i]
+              }
+            }
+          ' "$COMMON_KERNEL_FOLDER/fs/Kconfig" > "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" \
+            && mv "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+          echo "➕ fs/Kconfig wired"
         fi
-
-        echo "✅ NoMount patch applied"
 
         echo "Adding NoMount configuration..."
-
         if ! grep -q "^CONFIG_NOMOUNT=y" "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"; then
           printf '%s\n' 'CONFIG_NOMOUNT=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         fi
-        echo "NOMOUNT_PATCH_NAME=$(basename "$NOMOUNT_PATCH")" >> "$GITHUB_ENV"
-        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "$(basename "$NOMOUNT_PATCH")" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "NOMOUNT_PATCH_NAME=kernel-integration-Kbuild" >> "$GITHUB_ENV"
+        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "kernel-integration (setup.sh method)" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
 
-        echo "Verifying NoMount files..."
-        ls -l "$COMMON_KERNEL_FOLDER/fs"/nomount*
+        echo "Verifying NoMount wiring..."
+        grep -n "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"
+        grep -n 'fs/nomount/Kconfig' "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+        ls -la "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
         echo "✅ NoMount integration completed"
-
         echo "::endgroup::"
 
     - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)

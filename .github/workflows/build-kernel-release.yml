@@ -675,6 +675,7 @@ jobs:
       module_name: ${{ steps.package.outputs.module_name }}
     env:
       NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Decide build strategy
         id: decide
@@ -707,13 +708,21 @@ jobs:
           source_dir="${RUNNER_TEMP}/nomount-module-source"
           module_dir="${RUNNER_TEMP}/nomount-metamodule"
           git clone --no-checkout https://github.com/maxsteeel/nomount.git "$source_dir"
-          git -C "$source_dir" fetch --depth=1 origin "$expected_commit"
+          # full history required: rev-list --count below must not hit a shallow boundary
+          git -C "$source_dir" fetch origin "$expected_commit"
           git -C "$source_dir" checkout --detach "$expected_commit"
           actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
           if [ "$actual_commit" != "$expected_commit" ]; then
             echo "NoMount module source mismatch: expected $expected_commit, got $actual_commit." >&2
             exit 1
           fi
+          
+          # Upstream-identical versioning (mirrors maxsteeel/nomount
+          # .github/workflows/build.yml): NAME-BASE_VERSION-<dev|release>-SHORT7-COMMIT_COUNT
+          NM_COMMIT_COUNT="$(git -C "$source_dir" rev-list --count HEAD)"
+          NM_UP_BRANCH="$(gh api "repos/maxsteeel/nomount/commits/${actual_commit}/branches-where-head" --jq '.[0].name' 2>/dev/null || true)"
+          [ -n "$NM_UP_BRANCH" ] || NM_UP_BRANCH="${{ inputs.nomount_branch }}"
+          if [ "$NM_UP_BRANCH" = "master" ]; then NM_TAG="release"; else NM_TAG="dev"; fi
 
           mkdir -p "$source_dir/bin"
           (
@@ -731,13 +740,18 @@ jobs:
           mkdir -p "$module_dir/bin"
           install -m 0755 "$source_dir/bin/nm-arm64" "$module_dir/bin/nm-arm64"
           install -m 0755 "$source_dir/bin/nm-arm" "$module_dir/bin/nm-arm"
-          sed -i "s/^versionCode=.*/versionCode=1/" "$module_dir/module.prop"
+          sed -i "s/^versionCode=.*/versionCode=${NM_COMMIT_COUNT}/" "$module_dir/module.prop"
           printf '%s\n' "$actual_commit" > "$module_dir/NOMOUNT_SOURCE_COMMIT"
 
-          PROP_VERSION="$(grep -E '^version=' "$module_dir/module.prop" | cut -d= -f2 | tr -d '[:space:]')"
-          [ -n "$PROP_VERSION" ] || PROP_VERSION="dev"
+          NAME="$(sed -n 's/^name=//p' "$module_dir/module.prop" | tr -d '\r' | tr -d ' ')"
+          BASE_VERSION="$(sed -n 's/^version=//p' "$module_dir/module.prop" | tr -d '\r' | tr -d ' ')"
           SHORT7="${actual_commit:0:7}"
-          MODULE_BASE="NoMount-${PROP_VERSION}-${SHORT7}"
+          MODULE_BASE="${NAME}-${BASE_VERSION}-${NM_TAG}-${SHORT7}-${NM_COMMIT_COUNT}"
+          if [ "$NM_TAG" = "release" ]; then
+            sed -i "s/^version=\(.*\)/version=\1 (${NM_COMMIT_COUNT})/" "$module_dir/module.prop"
+          else
+            sed -i "s/^version=\(.*\)/version=\1 (${NM_COMMIT_COUNT}-${SHORT7}-dev)/" "$module_dir/module.prop"
+          fi
           module_zip="${RUNNER_TEMP}/${MODULE_BASE}.zip"
           (
             cd "$module_dir"
@@ -754,14 +768,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           ls -l "$module_zip"
 
-      - name: Upload built module for the release job
+      - name: Upload built module for the release job (raw, not re-zipped)
         if: steps.decide.outputs.built == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nomount-module-built
-          path: |
-            ${{ runner.temp }}/NoMount-*.zip
-            ${{ runner.temp }}/NoMount-*.zip.sha256
+          path: ${{ runner.temp }}/NoMount-*.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload built module checksum (raw, not re-zipped)
+        if: steps.decide.outputs.built == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nomount-module-sha256
+          path: ${{ runner.temp }}/NoMount-*.zip.sha256
+          archive: false
           if-no-files-found: error
           retention-days: 7
 
@@ -1236,11 +1259,21 @@ jobs:
           fi
           sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
 
-      - name: 📦 Upload NoMount module to run artifacts
-        uses: actions/upload-artifact@v4
+      - name: 📤 Upload NoMount module to run artifacts (raw, not re-zipped)
+        uses: actions/upload-artifact@v7
         with:
           name: nomount-module
           path: ./downloaded-artifacts/NoMount-*.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 📤 Upload NoMount module checksum to run artifacts (raw, not re-zipped)
+        uses: actions/upload-artifact@v7
+        with:
+          name: nomount-module-sha256
+          path: ./downloaded-artifacts/NoMount-*.zip.sha256
+          archive: false
           if-no-files-found: error
           retention-days: 7
           
@@ -1646,7 +1679,7 @@ jobs:
               gh release upload "${{ env.NEW_TAG }}" "$file" --clobber
             fi
           done
-          for file in ./downloaded-artifacts/*.apk ./downloaded-artifacts/SHA256SUMS.txt; do
+          for file in ./downloaded-artifacts/*.apk ./downloaded-artifacts/NoMount-*.zip.sha256 ./downloaded-artifacts/SHA256SUMS.txt; do
             if [ -f "$file" ]; then
               echo "Uploading $file..."
               gh release upload "${{ env.NEW_TAG }}" "$file" --clobber

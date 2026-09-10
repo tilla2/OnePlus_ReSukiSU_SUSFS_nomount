@@ -617,10 +617,9 @@ jobs:
             src="explicit-commit"
             if find_module_for "$commit"; then
               module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
-              echo "✅ Exact CI-built module found: $module_name"
+              echo "✅ Exact CI-built module found: $module_name (informational — the module is built from source in this run)"
             else
-              echo "::error::No live NoMount module artifact for explicit commit $commit. A bundleable module needs a successful 'build module' CI run with unexpired artifacts for exactly this SHA. Pick a CI-verified commit or leave both inputs empty for auto mode."
-              exit 1
+              echo "::warning::No live NoMount module artifact for commit $commit — the module will be built from source in this run instead."
             fi
           else
             # ── Mode 2: auto — newest commit on <branch> whose own CI built a module ──
@@ -628,13 +627,14 @@ jobs:
               --jq '[.workflow_runs[] | select(.path | endswith("build.yml"))][0:10][].head_sha' 2>/dev/null || true)
             for sha in "${candidates[@]:-}"; do
               [ -z "$sha" ] && continue
+              commit="$sha"
+              src="latest-ci-success-$branch"
+              echo "🔀 Latest CI-successful commit on '$branch': $commit"
               if find_module_for "$sha"; then
-                commit="$sha"
                 module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
-                src="latest-ci-success-$branch"
-                echo "🔀 Latest CI-verified commit on '$branch': $commit (module: $module_name)"
-                break
+                echo "   Upstream CI module (informational): $module_name"
               fi
+              break
             done
             # ── Mode 3: fallback — known-good pin, static verified ZIP ──
             if [ -z "$commit" ]; then
@@ -656,16 +656,115 @@ jobs:
             echo "## 🚫 NoMount Resolution"
             echo ""
             echo "**Commit:** \`$commit\` ($src) — locked for **all** matrix builds in this run."
-            if [ -n "$module_name" ]; then
-              echo ""
-              echo "**Userspace module:** \`$module_name.zip\` — exact CI build for this commit, bundled into the release."
-            else
+            if [ "$src" = "fallback-known-good-pin" ]; then
               echo ""
               echo "**Userspace module:** pinned static ZIP (matches \`1dacddf\`)."
+            else
+              echo ""
+              echo "**Userspace module:** built from source in this run (zig cc) — exact match for \`$commit\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::endgroup::"
           
+  build-nomount-module:
+    name: Build NoMount module from source (non-pinned commits)
+    needs: resolve-nomount
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.decide.outputs.built }}
+      module_name: ${{ steps.package.outputs.module_name }}
+    env:
+      NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
+    steps:
+      - name: Decide build strategy
+        id: decide
+        run: |
+          if [ "$NM_SHA" = "1dacddf5d85ced5b6c26ab09e621e366e4f0cd88" ]; then
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "Pinned NoMount commit - the verified prebuilt module zip is used downstream."
+          else
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo "Custom NoMount commit $NM_SHA - building the userspace module from this exact source."
+          fi
+
+      - name: Set up Zig
+        if: steps.decide.outputs.built == 'true'
+        uses: jetsung/setup-zig@v0.0.4
+        with:
+          version: master
+
+      - name: Build and package metamodule
+        id: package
+        if: steps.decide.outputs.built == 'true'
+        run: |
+          set -euo pipefail
+          expected_commit="$NM_SHA"
+          if ! [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "NoMount commit must be a full 40-character SHA." >&2
+            exit 2
+          fi
+
+          source_dir="${RUNNER_TEMP}/nomount-module-source"
+          module_dir="${RUNNER_TEMP}/nomount-metamodule"
+          git clone --no-checkout https://github.com/maxsteeel/nomount.git "$source_dir"
+          git -C "$source_dir" fetch --depth=1 origin "$expected_commit"
+          git -C "$source_dir" checkout --detach "$expected_commit"
+          actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
+          if [ "$actual_commit" != "$expected_commit" ]; then
+            echo "NoMount module source mismatch: expected $expected_commit, got $actual_commit." >&2
+            exit 1
+          fi
+
+          mkdir -p "$source_dir/bin"
+          (
+            cd "$source_dir/userspace/src"
+            zig cc -target aarch64-linux -Oz -mcmodel=tiny -static -nostdlib \
+              -ffreestanding -fno-unwind-tables -fno-ident -Wno-invalid-noreturn \
+              -Wl,--entry=_start nm.c -o ../../bin/nm-arm64
+            zig cc -target arm-linux -Oz -static -nostdlib -ffreestanding \
+              -fno-unwind-tables -fno-ident -Wno-invalid-noreturn \
+              -ffunction-sections -fdata-sections -Wl,--gc-sections \
+              -Wl,--entry=_start nm.c -o ../../bin/nm-arm
+          )
+
+          cp -a "$source_dir/module" "$module_dir"
+          mkdir -p "$module_dir/bin"
+          install -m 0755 "$source_dir/bin/nm-arm64" "$module_dir/bin/nm-arm64"
+          install -m 0755 "$source_dir/bin/nm-arm" "$module_dir/bin/nm-arm"
+          sed -i "s/^versionCode=.*/versionCode=1/" "$module_dir/module.prop"
+          printf '%s\n' "$actual_commit" > "$module_dir/NOMOUNT_SOURCE_COMMIT"
+
+          PROP_VERSION="$(grep -E '^version=' "$module_dir/module.prop" | cut -d= -f2 | tr -d '[:space:]')"
+          [ -n "$PROP_VERSION" ] || PROP_VERSION="dev"
+          SHORT7="${actual_commit:0:7}"
+          MODULE_BASE="NoMount-${PROP_VERSION}-${SHORT7}"
+          module_zip="${RUNNER_TEMP}/${MODULE_BASE}.zip"
+          (
+            cd "$module_dir"
+            zip -qr "$module_zip" .
+          )
+          printf '%s  %s\n' "$(sha256sum "$module_zip" | cut -d' ' -f1)" "${MODULE_BASE}.zip" > "${module_zip}.sha256"
+
+          echo "module_name=${MODULE_BASE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### NoMount module built from source"
+            echo "- Commit: \`$actual_commit\`"
+            echo "- Zip: \`$MODULE_BASE.zip\`"
+            echo "- sha256: \`$(cut -d' ' -f1 "${module_zip}.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -l "$module_zip"
+
+      - name: Upload built module for the release job
+        if: steps.decide.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nomount-module-built
+          path: |
+            ${{ runner.temp }}/NoMount-*.zip
+            ${{ runner.temp }}/NoMount-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   mirror_toolchain:
     needs: set-op-model
     if: ${{ inputs.mirror_toolchains }}
@@ -981,13 +1080,14 @@ jobs:
           echo "::endgroup::"
 
   trigger-release:
-    needs: [set-op-model, resolve-nomount, build]
+    needs: [set-op-model, resolve-nomount, build-nomount-module, build]
     runs-on: ubuntu-latest
     if: |
       !cancelled() &&
       inputs.make_release == true &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success'
+      needs.resolve-nomount.result == 'success' &&
+      needs.build-nomount-module.result == 'success'
     env:
       REPO_OWNER: ${{ github.repository_owner }}
       REPO_NAME: ${{ github.event.repository.name }}
@@ -995,7 +1095,8 @@ jobs:
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
       NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
       NM_MODE: ${{ needs.resolve-nomount.outputs.nomount_source }}
-      NM_MODULE_NAME: ${{ needs.resolve-nomount.outputs.nomount_module_name }}
+      NM_BUILT: ${{ needs.build-nomount-module.outputs.built }}
+      NM_MODULE_NAME: ${{ needs.build-nomount-module.outputs.module_name || needs.resolve-nomount.outputs.nomount_module_name }}
       NM_ARTIFACT_ID: ${{ needs.resolve-nomount.outputs.nomount_artifact_id }}
       NM_RUN_URL: ${{ needs.resolve-nomount.outputs.nomount_run_url }}
     steps:
@@ -1115,28 +1216,23 @@ jobs:
               "NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
               "453daaf7312a9eb66e05d3dd06d9ef364265e87b0ed619db890601dab767e169"
           else
-            [ -n "$NM_MODULE_NAME" ] || { echo "::error::resolve-nomount produced no module name for a non-pinned commit"; exit 1; }
-            echo "NoMount resolved to $NM_SHA ($NM_MODE) — fetching the exact CI-built module: $NM_MODULE_NAME"
-            MODULE_STAGE="$RUNNER_TEMP/nomount-module-stage"
-            rm -rf "$MODULE_STAGE" && mkdir -p "$MODULE_STAGE"
-            curl --fail --location --retry 3 --retry-delay 5 \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --output "$RUNNER_TEMP/nomount-artifact.zip" \
-              "https://api.github.com/repos/maxsteeel/nomount/actions/artifacts/$NM_ARTIFACT_ID/zip"
-            unzip -q "$RUNNER_TEMP/nomount-artifact.zip" -d "$MODULE_STAGE"
-            if [ ! -f "$MODULE_STAGE/module.prop" ]; then
-              inner="$(find "$MODULE_STAGE" -maxdepth 2 -name module.prop | head -n1)"
-              [ -n "$inner" ] && mv "$(dirname "$inner")"/* "$MODULE_STAGE"/
+            echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
+            MODULE_ZIP="$(find . -maxdepth 1 -name 'NoMount-*.zip' | head -n1)"
+            [ -n "$MODULE_ZIP" ] || { echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"; exit 1; }
+            if [ -f "${MODULE_ZIP}.sha256" ]; then
+              sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
+              echo "✅ Built module SHA256 verified (sidecar)"
             fi
-            [ -f "$MODULE_STAGE/module.prop" ] || { echo "::error::Downloaded NoMount artifact has no module.prop at module root; refusing to bundle a broken module."; exit 1; }
+            unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
             echo "module.prop name/version line:"
-            grep -E '^(name|version)=' "$MODULE_STAGE/module.prop"
-            ls -l "$MODULE_STAGE/bin/" | grep -E 'nm-arm64|lkmloader-arm64' || echo "::warning::nm/lkmloader binaries not found in module bin/ — verify manually"
-            (cd "$MODULE_STAGE" && zip -qr9 "$RUNNER_TEMP/$NM_MODULE_NAME.zip" .)
-            mv "$RUNNER_TEMP/$NM_MODULE_NAME.zip" ./
-            unzip -t "$NM_MODULE_NAME.zip" > /dev/null && echo "✅ module zip integrity OK"
-            ls -la "$NM_MODULE_NAME.zip"
-            sha256sum "$NM_MODULE_NAME.zip"
+            unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
+            unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
+            UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
+            if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
+              echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
+              exit 1
+            fi
+            echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
           fi
           sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
 
@@ -1361,11 +1457,16 @@ jobs:
 
           EOF
 
-          if [ -n "$NM_MODULE_NAME" ]; then
+          if [ "$NM_BUILT" = "true" ]; then
             cat << EOF >> release_notes.md
-          | Userspace module | [\`$NM_MODULE_NAME.zip\`](https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${NEW_TAG}/${NM_MODULE_NAME}.zip) — built by nomount CI from exactly this commit |
-          | Module CI build | [$NM_RUN_URL]($NM_RUN_URL) |
+          | Userspace module | [\`$NM_MODULE_NAME.zip\`](https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${NEW_TAG}/${NM_MODULE_NAME}.zip) — built from source in this run (zig cc, static, arm64+arm) from exactly this commit |
+          | Module build | [This workflow run](${GITHUB_SERVER_URL}/${REPO_OWNER}/${REPO_NAME}/actions/runs/${GITHUB_RUN_ID}) — source commit embedded in the zip as \`NOMOUNT_SOURCE_COMMIT\` |
           EOF
+            if [ -n "$NM_RUN_URL" ]; then
+              cat << EOF >> release_notes.md
+          | Upstream CI reference | [$NM_RUN_URL]($NM_RUN_URL) |
+          EOF
+            fi
           else
             cat << EOF >> release_notes.md
           | Userspace module | \`NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip\` — pinned verified build ([source release](https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/tag/nomount-dev-20260809)) |

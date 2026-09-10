@@ -53,6 +53,11 @@ inputs:
     required: false
     type: boolean
     default: false
+  apply_bore:
+    description: 'Apply BoRE scheduler patch (Bouteillepleine/kernel_patches experimental/bore_*.patch)'
+    required: false
+    type: boolean
+    default: true
   github_token:
     description: 'GitHub Token'
     required: true
@@ -125,6 +130,7 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        echo "OP_BORE=${{ inputs.apply_bore }}" >> "$GITHUB_ENV"
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -299,7 +305,7 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
-        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3; do
+        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3 OP_BORE; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
             errors+=("$bool_opt must be true or false if set. Got: '$val'")
@@ -2248,6 +2254,32 @@ runs:
         echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
 
+    - name: Apply BoRE
+      if: ${{ env.OP_BORE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BoRE scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        BORE_PATCH="bore_${KERNEL_VER}.patch"
+        curl -sSL --fail -o /tmp/bore.patch \
+          "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}"
+        if ! patch -p1 --forward < /tmp/bore.patch; then
+          echo "::error::BoRE patch failed for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH})"
+          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+          patch -p1 --forward < /tmp/bore.patch > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1 || true
+          find . -name '*.rej' -newer /tmp/bore.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; || true
+          exit 1
+        fi
+        grep -q 'config SCHED_BORE' init/Kconfig
+        grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
+        echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
+        echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+        echo "BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
+
     - name: Add TTL Target Support
       if: ${{ env.OP_TTL == 'true' }}
       shell: bash
@@ -2575,6 +2607,7 @@ runs:
           echo "kernel=${ANDROID_VER}-${TKERNEL_VER}"
           echo "adios=${ADIOS_ENABLED:-not-applied}"
           echo "bbrv3=${BBR3_APPLIED:-not-applied}"
+          echo "bore=${BORE_APPLIED:-not-applied}"
           echo "result=ALL_PATCHES_APPLIED_CLEANLY"
         } > "$VERDICT"
         cat "$VERDICT"
@@ -3037,6 +3070,7 @@ runs:
           echo "=== OnePlus Features ==="
           echo "BBR: ${{ env.OP_BBR }}"
           echo "BBG: ${{ env.OP_BBG }}"
+          echo "BoRE: ${{ env.OP_BORE }}"
           echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
           echo "TTL: ${{ env.OP_TTL }}"
           echo "IP_SET & IPv6 NAT: ${{ env.OP_IP_SET }}"
@@ -3103,6 +3137,7 @@ runs:
           echo "|---------|--------|"
           echo "| **BBR** | ${{ env.OP_BBR }} |"
           echo "| **BBG** | ${{ env.OP_BBG }} |"
+          echo "| **BoRE** | ${{ env.OP_BORE }} |"
           echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
           echo "| **TTL** | ${{ env.OP_TTL }} |"
           echo "| **IP_SET & IPv6 NAT** | ${{ env.OP_IP_SET }} |"

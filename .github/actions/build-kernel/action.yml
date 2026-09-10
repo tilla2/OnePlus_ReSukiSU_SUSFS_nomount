@@ -48,6 +48,11 @@ inputs:
     required: false
     type: boolean
     default: false
+  patch_dry_run:
+    description: 'Apply all patches and stop before compilation (verification mode)'
+    required: false
+    type: boolean
+    default: false
   github_token:
     description: 'GitHub Token'
     required: true
@@ -1654,12 +1659,19 @@ runs:
         echo "::group::Enable ADIOS I/O scheduler"
         cd "$COMMON_KERNEL_FOLDER"
         if [ ! -f block/adios.c ]; then
-          curl -sSL --fail -o /tmp/adios.patch \
-            "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/adios_ioscheduler_${KERNEL_VER}.patch"
+          ADIOS_FILE="adios_ioscheduler_${KERNEL_VER}.patch"
+          case "${CONFIG_BRANCH:-}" in
+            *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
+          esac
+          curl -sSL --fail -o /tmp/adios.patch             "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
           if ! patch -p1 --forward < /tmp/adios.patch; then
-            echo "::error::ADIOS patch failed for ${KERNEL_VER}"
+            echo "::error::ADIOS patch failed for ${KERNEL_VER} (${ADIOS_FILE})"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            patch -p1 --forward < /tmp/adios.patch > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1 || true
+            find . -name '*.rej' -newer /tmp/adios.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; || true
             exit 1
           fi
+        fi
         else
           echo "block/adios.c already present, enabling config only"
         fi
@@ -2203,14 +2215,25 @@ runs:
         if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
           curl -sSL --fail -o /tmp/bbr3_sysctl_add.patch "$BBR3_BASE/sysctl_add_proc_dou8vec_minmax.patch"
           curl -sSL --fail -o /tmp/bbr3_sysctl_fix.patch "$BBR3_BASE/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch"
-          patch -p1 --forward < /tmp/bbr3_sysctl_add.patch
-          patch -p1 --forward < /tmp/bbr3_sysctl_fix.patch
+          if ! patch -p1 --forward < /tmp/bbr3_sysctl_add.patch; then
+            echo "::error::BBRv3 sysctl helper (proc_dou8vec_minmax) failed for ${ANDROID_VER}-${KERNEL_VER}"
+            exit 1
+          fi
+          if ! patch -p1 --forward < /tmp/bbr3_sysctl_fix.patch; then
+            echo "::error::BBRv3 sysctl data-races fix failed for ${ANDROID_VER}-${KERNEL_VER}"
+            exit 1
+          fi
         fi
         if ! patch -p1 --forward < /tmp/bbr3_main.patch; then
           echo "::error::BBRv3 backport failed for ${ANDROID_VER}-${KERNEL_VER}"
           exit 1
         fi
-        patch -p1 --forward < /tmp/bbr3_debugfs.patch
+        if patch -p1 --dry-run --forward < /tmp/bbr3_debugfs.patch; then
+          patch -p1 --forward < /tmp/bbr3_debugfs.patch
+          echo "BBRv3 debugfs diagnostics (0002) applied"
+        else
+          echo "::warning::0002 debugfs patch targets the 6.12 tcp_bbr3.c post-image; not compatible with ${ANDROID_VER}-${KERNEL_VER}. BBRv3 core is unaffected - skipping diagnostics only."
+        fi
         grep -q 'config TCP_CONG_BBR3' net/ipv4/Kconfig
         grep -q 'tcp_bbr3' net/ipv4/Makefile
         grep -q '^CONFIG_TCP_CONG_BBR=y' arch/arm64/configs/gki_defconfig || \
@@ -2540,6 +2563,40 @@ runs:
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
 
+    - name: Patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Patch dry-run verdict"
+        VERDICT="$DEBUG_ARTIFACTS_DIR/patch_dry_run_${OP_MODEL}_${OP_OS_VERSION}.txt"
+        {
+          echo "device=$OP_MODEL os=$OP_OS_VERSION"
+          echo "kernel=${ANDROID_VER}-${TKERNEL_VER}"
+          echo "adios=${ADIOS_ENABLED:-not-applied}"
+          echo "bbrv3=${BBR3_APPLIED:-not-applied}"
+          echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+        } > "$VERDICT"
+        cat "$VERDICT"
+        echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+        echo "::endgroup::"
+
+    - name: Upload patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-dry-run-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}
+        path: ${{ env.DEBUG_ARTIFACTS_DIR }}/patch_dry_run_*.txt
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Stop before build (dry run)
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        echo "Dry run complete — see the patch-dry-run artifact. Not building."
+        exit 1
+        
     - name: Build Kernel
       id: build_kernel_step
       shell: bash

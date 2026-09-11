@@ -1,4 +1,4 @@
-name: Build and Release OnePlus Kernels
+name: Build and Release OnePlus Kernels (The-Big-One)
 
 permissions:
   contents: write
@@ -104,11 +104,6 @@ on:
         required: false
         type: boolean
         default: false
-      apply_bore:
-        description: 'Apply BoRE scheduler patch (all kernel versions)'
-        required: false
-        type: boolean
-        default: true
 
 jobs:
   set-op-model:
@@ -331,6 +326,7 @@ jobs:
           
           declare -A susfs_hashes
           declare -A susfs_versions_per_key
+          SUSFS_CLONE_REPO=""
           
           for key in "${active_keys[@]}"; do
             default_val="${default_branches[$key]}"
@@ -375,9 +371,37 @@ jobs:
               sleep $RETRY_DELAY
             done
             
+            # Fallback: GitLab GraphQL unreachable -> git clone susfs4ksu
+            # once and extract every key's data from the clone (resolved SHA;
+            # and in release mode SUSFS_VERSION from susfs.h).
+            if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
+              echo "::warning::GitLab GraphQL unreachable for '$key'; falling back to git clone of susfs4ksu"
+              if [ -z "$SUSFS_CLONE_REPO" ]; then
+                SUSFS_CLONE_DIR="$(mktemp -d)"
+                if git clone --no-checkout --filter=blob:none "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_CLONE_DIR/repo" 2>/dev/null \
+                   || git clone --no-checkout "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_CLONE_DIR/repo"; then
+                  SUSFS_CLONE_REPO="$SUSFS_CLONE_DIR/repo"
+                fi
+              fi
+              FALLBACK_SHA=""
+              if [ -n "$SUSFS_CLONE_REPO" ] && git -C "$SUSFS_CLONE_REPO" checkout -q --detach "$user_val"; then
+                FALLBACK_SHA="$(git -C "$SUSFS_CLONE_REPO" rev-parse HEAD)"
+                if [ "${{ inputs.make_release }}" = "true" ]; then
+                  SUSFS_VER_FALLBACK="$(git -C "$SUSFS_CLONE_REPO" show "HEAD:kernel_patches/include/linux/susfs.h" 2>/dev/null | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || true)"
+                  if [ -n "$SUSFS_VER_FALLBACK" ]; then
+                    susfs_versions_per_key["$key"]="$SUSFS_VER_FALLBACK"
+                  fi
+                fi
+              fi
+              if [ -n "$FALLBACK_SHA" ]; then
+                resolved="$FALLBACK_SHA"
+                echo "  ✅ $key → resolved via clone fallback: $resolved"
+              fi
+            fi
+            
             # Final Validation — SUSFS hash
             if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
-              echo "::error::Could not resolve SUSFS ref '$user_val' for $key on GitLab."
+              echo "::error::Could not resolve SUSFS ref '$user_val' for $key on GitLab (GraphQL and git-clone fallback both failed)."
               exit 1
             fi
             
@@ -519,7 +543,7 @@ jobs:
           - Create Release: ${{ inputs.make_release && '✅ Yes' || '❌ No' }}
           - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
-          - Apply BoRE: ${{ inputs.apply_bore && '✅ Yes' || '❌ No' }}
+          - BoRE: per-device \`bore\` flag in configs/ (dry run remains global)
           
           **SUSFS Configuration:**
           EOF
@@ -691,13 +715,8 @@ jobs:
       - name: Decide build strategy
         id: decide
         run: |
-          if [ "$NM_SHA" = "1dacddf5d85ced5b6c26ab09e621e366e4f0cd88" ]; then
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            echo "Pinned NoMount commit - the verified prebuilt module zip is used downstream."
-          else
-            echo "built=true" >> "$GITHUB_OUTPUT"
-            echo "Custom NoMount commit $NM_SHA - building the userspace module from this exact source."
-          fi
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          echo "Building the userspace module from source for NoMount $NM_SHA — commit-exact by construction."
 
       - name: Set up Zig
         if: steps.decide.outputs.built == 'true'
@@ -969,7 +988,6 @@ jobs:
           clean: ${{ inputs.clean_build }}
           debug: ${{ inputs.debug }}
           patch_dry_run: ${{ inputs.patch_dry_run }}
-          apply_bore: ${{ inputs.apply_bore }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload patch failure forensics
@@ -1142,6 +1160,7 @@ jobs:
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
+      KSU_SHA: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
       NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
       NM_MODE: ${{ needs.resolve-nomount.outputs.nomount_source }}
       NM_BUILT: ${{ needs.build-nomount-module.outputs.built }}
@@ -1213,7 +1232,7 @@ jobs:
           ls -A ./downloaded-artifacts
           echo "✅ ccache binary excluded from release staging"
 
-      - name: 📦 Fetch verified companion downloads
+      - name: 📦 Fetch commit-matched manager apps
         run: |
           set -euo pipefail
           cd ./downloaded-artifacts
@@ -1223,79 +1242,72 @@ jobs:
             exit 1
           fi
 
-          download_and_verify() {
-            local url="$1"
-            local name="$2"
-            local expected_sha256="$3"
-            curl --fail --location --retry 3 --retry-delay 5 --output "$name" "$url"
-            printf '%s  %s\n' "$expected_sha256" "$name" | sha256sum --check --status
-          }
-
           case "${{ inputs.ksu_type }}" in
-            KSUN)
-              download_and_verify \
-                "https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.3.0/KernelSU_Next_v3.3.0_33214-release.apk" \
-                "KernelSU_Next_v3.3.0_33214-release.apk" \
-                "fd0b12385c98fe9d5f4f1257b5f184e55c74c1376637507df0718305f5d7a924"
-              download_and_verify \
-                "https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.3.0/KernelSU_Next_v3.3.0-spoofed_33214-release.apk" \
-                "KernelSU_Next_v3.3.0-spoofed_33214-release.apk" \
-                "773d99e256563d36f8543235c96274021c59cf65efed783170bbc7effdf24ee3"
-              ;;
-            ReSukiSU)
-              download_and_verify \
-                "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/ReSukiSU_v4.1.0_35055-arm64-v8a-release.apk" \
-                "ReSukiSU_v4.1.0_35055-arm64-v8a-release.apk" \
-                "78862d9adcca1c1281e0df26680e9cb7d7cb6ebee7cb5994b2ffbde9e0ab377a"
-              download_and_verify \
-                "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/ReSukiSU_v4.1.0-spoofed_35055-arm64-v8a-release.apk" \
-                "ReSukiSU_v4.1.0-spoofed_35055-arm64-v8a-release.apk" \
-                "f48de5859406a161b75de97ae91b8c2595421498b574d0c88a5ee373121e3e43"
-              ;;
-            KSU)
-              download_and_verify \
-                "https://github.com/tiann/KernelSU/releases/download/v3.2.5/KernelSU_v3.2.5_32525-release.apk" \
-                "KernelSU_v3.2.5_32525-release.apk" \
-                "1417081413bf7ab1de8e440ecbcb62685037c8f28f048f0f8b79e305b31ab916"
-              ;;
+            KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
+            ReSukiSU)  MANAGER_REPO="ReSukiSU/ReSukiSU" ;;
+            KSU)       MANAGER_REPO="tiann/KernelSU" ;;
           esac
-          if [ "$NM_SHA" = "1dacddf5d85ced5b6c26ab09e621e366e4f0cd88" ]; then
-            download_and_verify \
-              "https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/download/nomount-dev-20260809/NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
-              "NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip" \
-              "453daaf7312a9eb66e05d3dd06d9ef364265e87b0ed619db890601dab767e169"
-              echo "NM_MODULE_NAME=NoMount-v1.1.1-dev-1dacddf-ReSukiSU" >> "$GITHUB_ENV"
-          else
-            echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
-            MODULE_ZIP="$(find . -maxdepth 1 -name 'NoMount-*.zip' | head -n1)"
-            [ -n "$MODULE_ZIP" ] || { echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"; exit 1; }
-            if [ -f "${MODULE_ZIP}.sha256" ]; then
-              sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
-              echo "✅ Built module SHA256 verified (sidecar)"
-            fi
-            unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
-            echo "module.prop name/version line:"
-            unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
-            unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
-            UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
-            if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
-              echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
-              exit 1
-            fi
-            echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
+          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
+
+          MANAGER_RUN_ID=""
+          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+            --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+
+          if [ -n "$MANAGER_RUN_ID" ]; then
+            echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
+            echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
+            mkdir -p /tmp/mgr
+            ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+            while read -r aid aname; do
+              [ -z "$aid" ] && continue
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip"
+              unzip -o -j "/tmp/mgr/${aname}.zip" '*.apk' -d ./ >/dev/null || true
+            done <<< "$ART_ROWS"
           fi
+
+          if ! ls ./*.apk >/dev/null 2>&1; then
+            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            LATEST_TAG=$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name')
+            echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/releases/tag/${LATEST_TAG}" >> "$GITHUB_ENV"
+            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
+              --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
+              case "$asset_url" in
+                *release*.apk|*release-*.apk) curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true ;;
+              esac
+            done
+          fi
+
+          if ! ls ./*.apk >/dev/null 2>&1; then
+            echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
+            exit 1
+          fi
+
+          echo "Manager APKs bundled into this release:"
+          ls -l ./*.apk
+          MANAGER_APK_NAMES="$(ls ./*.apk | xargs -n1 basename | paste -sd',' -)"
+          echo "MANAGER_APK_NAMES=${MANAGER_APK_NAMES}" >> "$GITHUB_ENV"
+
+          # NoMount module (always built from source now) — provenance verification
+          echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
+          MODULE_ZIP="$(find . -maxdepth 1 -name 'NoMount-*.zip' | head -n1)"
+          [ -n "$MODULE_ZIP" ] || { echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"; exit 1; }
+          if [ -f "${MODULE_ZIP}.sha256" ]; then
+            sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
+            echo "✅ Built module SHA256 verified (sidecar)"
+          fi
+          unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
+          echo "module.prop name/version line:"
+          unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
+          unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
+          UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
+          if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
+            echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
+            exit 1
+          fi
+          echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
           sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
 
-      - name: 📤 Upload NoMount module to run artifacts (raw, not re-zipped)
-        if: env.NM_BUILT != 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: nomount-module
-          path: ./downloaded-artifacts/NoMount-*.zip
-          archive: false
-          if-no-files-found: error
-          retention-days: 7
-          
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
         run: |
@@ -1375,7 +1387,7 @@ jobs:
             feature_flags=$(jq -r --arg MODEL "$model" --arg ORIG_MODEL "$possible_orig_model" --arg OS "$os_ver" '
               ([ .[] | select(.model == $ORIG_MODEL and .os_version == $OS) ][0]) //
               ([ .[] | select(.model == $MODEL      and .os_version == $OS) ][0]) |
-              "\(.hmbird // false)\t\(.susfs // false)\t\(.bbr // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)\t\(.bbr3 // false)\t\(.lz4_upgrade // false)\t\(.adios // false)"
+              "\(.hmbird // false)\t\(.susfs // false)\t\(.bbr // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)\t\(.bbr3 // false)\t\(.bore // false)\t\(.lz4_upgrade // false)\t\(.adios // false)"
             ' <<< "$JSON_BUILD_DATA")
             
             features=()
@@ -1384,7 +1396,7 @@ jobs:
               echo "Warning: No JSON entry found for model: $model" >&2
               features_str="N/A"
             else
-              IFS=$'\t' read -r hmbird susfs bbr bbg ttl ip_set unicode ds ntsync bbr3 lz4_upgrade adios <<< "$feature_flags"
+              IFS=$'\t' read -r hmbird susfs bbr bbg ttl ip_set unicode ds ntsync bbr3 bore lz4_upgrade adios <<< "$feature_flags"
               
               # Build features string based on boolean values
               [[ "$hmbird" == "true" ]] && features+=("🐦 HMBIRD")
@@ -1397,6 +1409,7 @@ jobs:
               [[ "$ds" == "true" ]] && features+=("💻 Droidspaces")
               [[ "$ntsync" == "true" ]] && features+=("🔃 NTSync")
               [[ "$bbr3" == "true" ]] && features+=("🚀 BBRv3")
+              [[ "$bore" == "true" ]] && features+=("🌀 BoRE")
               [[ "$lz4_upgrade" == "true" ]] && features+=("⚡ LZ4 1.10")
               [[ "$adios" == "true" ]] && features+=("🧭 ADIOS")
               
@@ -1447,6 +1460,8 @@ jobs:
             ReSukiSU) root_release_label="ReSukiSU $ksu_ver_global" ;;
             KSU) root_release_label="KernelSU $ksu_ver_global" ;;
           esac
+          MANAGER_NAMES="${MANAGER_APK_NAMES:-unknown}"
+          MANAGER_SRC="${MANAGER_RUN_URL:-}"
           
           cat << EOF >> release_notes.md
           
@@ -1519,10 +1534,6 @@ jobs:
           | Upstream CI reference | [$NM_RUN_URL]($NM_RUN_URL) |
           EOF
             fi
-          else
-            cat << EOF >> release_notes.md
-          | Userspace module | \`NoMount-v1.1.1-dev-1dacddf-ReSukiSU.zip\` — pinned verified build ([source release](https://github.com/SSS1981-op/OnePlus_ReSukiSU_SUSFS/releases/tag/nomount-dev-20260809)) |
-          EOF
           fi
 
           cat << EOF >> release_notes.md
@@ -1591,31 +1602,12 @@ jobs:
           
           ## 📱 Manager Applications
           
-          ### Official Manager
-          EOF
-          if [ "$ksu_type" == "KSUN" ]; then
-            cat << EOF >> release_notes.md
-          - **KernelSU Next Manager**
-            → [GitHub Release](https://github.com/KernelSU-Next/KernelSU-Next/releases/tag/v3.3.0)
-          - **Included release assets:** normal and spoofed KernelSU Next v3.3.0 managers plus the verified NoMount flashable ZIP.
-          EOF
-          elif [ "$ksu_type" == "ReSukiSU" ]; then
-            cat << EOF >> release_notes.md
-          - **ReSukiSU Manager**
-            → [Official Documentation](https://resukisu.github.io/guide/install.html#Get-manager)
-          - **Included release assets:** regular and spoofed ReSukiSU v4.1.0 managers plus the verified NoMount flashable ZIP.
-          EOF
-          elif [ "$ksu_type" == "KSU" ]; then
-            cat << EOF >> release_notes.md
-          - **KernelSU Manager**
-            → [GitHub Release](https://github.com/tiann/KernelSU/releases/tag/v3.2.5)
-          - **Included release assets:** official KernelSU v3.2.5 manager plus the verified NoMount flashable ZIP.
+          - **${ROOT_DISPLAY} Manager (commit-exact: \`${KSU_SHA:0:12}\`)**
+            → [Source build for this release](${MANAGER_SRC})
+          - **Included release assets:** ${MANAGER_NAMES}
           ### Required Module
-          - **KSU SUSFS Module** (Required for SUSFS features)  
+          - **KSU SUSFS Module** (Required for SUSFS features)
             → [GitHub Release](https://github.com/sidex15/ksu_module_susfs/releases)
-          EOF
-          fi
-          cat << EOF >> release_notes.md
           ### Recommended Flasher
           - **Kernel Flasher** (compatible with AnyKernel3 ZIPs, backups, and OTA)
             → [GitHub Release](https://github.com/fatalcoder524/KernelFlasher/releases)
@@ -1641,6 +1633,7 @@ jobs:
           
           ### This Release
           - $root_release_label, SUSFS $SUSFS_BASE_VERSION, and NoMount dev integration.
+          - Per-device BoRE scheduler flag (configs/), BBRv3 and ADIOS with probe-first soft-skip.
           - IPSet, IPv6 NAT, TTL / hop-limit targets, and BBR networking support.
           - TMPFS XATTR / POSIX ACL, Droidspaces, NTSync, and USB OTG support.
           - Ptrace compatibility for older kernel families and Unicode path handling fixes.

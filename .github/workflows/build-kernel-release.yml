@@ -1219,7 +1219,6 @@ jobs:
         with:
           path: ./downloaded-artifacts
           merge-multiple: true
-          skip-decompress: true
 
       - name: 🧹 Exclude ccache binary from release staging
         run: |
@@ -1229,6 +1228,7 @@ jobs:
           # before notes generation / asset upload. The ccache download-once
           # mechanism (prepare_ccache job + ccache-binary artifact) is untouched.
           rm -f ./downloaded-artifacts/ccache*
+          rm -f ./downloaded-artifacts/*.rej ./downloaded-artifacts/*.log
           ls -A ./downloaded-artifacts
           echo "✅ ccache binary excluded from release staging"
 
@@ -1316,6 +1316,15 @@ jobs:
           # Collect build metadata
           declare -A device_info
           
+          # Defensive: if matrix.json ever arrives as a zip container, jq would die
+          # with exit 2. Unwrap it, then fail loudly instead of silently.
+          if [ -f ./downloaded-artifacts/matrix.json ] && head -c 2 ./downloaded-artifacts/matrix.json | grep -q PK; then
+            echo "::warning::matrix.json arrived as a zip container; unwrapping it"
+            mv ./downloaded-artifacts/matrix.json ./downloaded-artifacts/matrix.json.zip
+            unzip -o ./downloaded-artifacts/matrix.json.zip -d ./downloaded-artifacts
+          fi
+          [ -f ./downloaded-artifacts/matrix.json ] || { echo "::error::matrix.json artifact missing after download; cannot generate release notes"; exit 1; }
+          jq -e . ./downloaded-artifacts/matrix.json > /dev/null || { echo "::error::matrix.json is not valid JSON after download"; exit 1; }
           JSON_BUILD_DATA=$(jq -c '.' ./downloaded-artifacts/matrix.json)
           
           for file in $(find downloaded-artifacts -maxdepth 1 -name "AK3_*.zip" -type f | sort); do

@@ -53,11 +53,6 @@ inputs:
     required: false
     type: boolean
     default: false
-  apply_bore:
-    description: 'Apply BoRE scheduler patch (Bouteillepleine/kernel_patches experimental/bore_*.patch)'
-    required: false
-    type: boolean
-    default: true
   github_token:
     description: 'GitHub Token'
     required: true
@@ -130,7 +125,9 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
-        echo "OP_BORE=${{ inputs.apply_bore }}" >> "$GITHUB_ENV"
+        if [ -z "${OP_BORE:-}" ]; then
+          echo "OP_BORE=true" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -1671,13 +1668,17 @@ runs:
             *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
           esac
           curl -sSL --fail -o /tmp/adios.patch             "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
-          if ! patch -p1 --forward < /tmp/adios.patch; then
-            echo "::error::ADIOS patch failed for ${KERNEL_VER} (${ADIOS_FILE})"
+          if ! patch -p1 --dry-run --forward < /tmp/adios.patch; then
+            echo "::warning::ADIOS patch does not apply for ${KERNEL_VER} (${ADIOS_FILE}) — soft-skipping ADIOS, build continues without it"
             mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
             patch -p1 --forward < /tmp/adios.patch > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1 || true
-            find . -name '*.rej' -newer /tmp/adios.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; || true
-            exit 1
+            find . -name '*.rej' -newer /tmp/adios.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; 2>/dev/null || true
+            find . -name '*.rej' -newer /tmp/adios.patch -delete 2>/dev/null || true
+            echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+            exit 0
           fi
+          patch -p1 --forward < /tmp/adios.patch
         else
           echo "block/adios.c already present, enabling config only"
         fi
@@ -2264,13 +2265,17 @@ runs:
         BORE_PATCH="bore_${KERNEL_VER}.patch"
         curl -sSL --fail -o /tmp/bore.patch \
           "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}"
-        if ! patch -p1 --forward < /tmp/bore.patch; then
-          echo "::error::BoRE patch failed for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH})"
+        if ! patch -p1 --dry-run --forward < /tmp/bore.patch; then
+          echo "::warning::BoRE patch does not apply for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) — soft-skipping BoRE, build continues without it"
           mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
           patch -p1 --forward < /tmp/bore.patch > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1 || true
-          find . -name '*.rej' -newer /tmp/bore.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; || true
-          exit 1
+          find . -name '*.rej' -newer /tmp/bore.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; 2>/dev/null || true
+          find . -name '*.rej' -newer /tmp/bore.patch -delete 2>/dev/null || true
+          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+          exit 0
         fi
+        patch -p1 --forward < /tmp/bore.patch
         grep -q 'config SCHED_BORE' init/Kconfig
         grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
@@ -2608,10 +2613,20 @@ runs:
           echo "adios=${ADIOS_ENABLED:-not-applied}"
           echo "bbrv3=${BBR3_APPLIED:-not-applied}"
           echo "bore=${BORE_APPLIED:-not-applied}"
-          echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+          echo "bore_skipped=${BORE_SKIPPED:-none}"
+          echo "adios_skipped=${ADIOS_SKIPPED:-none}"
+          if [ -n "${BORE_SKIPPED:-}" ] || [ -n "${ADIOS_SKIPPED:-}" ]; then
+            echo "result=PARTIAL_PATCHES_APPLIED"
+          else
+            echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+          fi
         } > "$VERDICT"
         cat "$VERDICT"
-        echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+        if [ -n "${BORE_SKIPPED:-}" ] || [ -n "${ADIOS_SKIPPED:-}" ]; then
+          echo "::notice::patch_dry_run=true — patches applied with soft-skips for ${OP_MODEL} ${OP_OS_VERSION} (see verdict). Compilation intentionally skipped."
+        else
+          echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+        fi
         echo "::endgroup::"
 
     - name: Upload patch dry-run verdict
@@ -2628,10 +2643,11 @@ runs:
       shell: bash
       run: |
         echo "Dry run complete — see the patch-dry-run artifact. Not building."
-        exit 1
+        exit 0
         
     - name: Build Kernel
       id: build_kernel_step
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       env:
         PYTHONWARNINGS: "ignore:invalid escape sequence"
@@ -2847,7 +2863,7 @@ runs:
 
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
-      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') }}
+      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2917,6 +2933,7 @@ runs:
 
     - name: Collect Build Stats / Validate Image
       id: collect_stats
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2974,6 +2991,7 @@ runs:
 
     - name: Create Kernel ZIP
       id: create_zip
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -3036,6 +3054,7 @@ runs:
         echo "::endgroup::"
 
     - name: Final Build Summary
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -3176,7 +3195,7 @@ runs:
         retention-days: 90
 
     - name: Upload Artifacts
-      if: success() && steps.create_zip.conclusion == 'success'
+      if: ${{ success() && steps.create_zip.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: ${{ env.ZIP_NAME }}
@@ -3186,7 +3205,7 @@ runs:
         retention-days: 90
 
     - name: Upload ccache log
-      if: success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: "${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}_${{ env.KERNEL_FULL_VER }}_ccache.log"

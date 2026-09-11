@@ -845,7 +845,7 @@ runs:
               attempt=$((attempt + 1))
           done
           
-          echo "::error::All attempts failed for $url"
+          echo "::warning::Archive fetch failed for $url after $max_attempts attempts - caller will fall back to git clone"
           return 1
         }
         
@@ -1671,9 +1671,11 @@ runs:
           if ! patch -p1 --dry-run --forward < /tmp/adios.patch; then
             echo "::warning::ADIOS patch does not apply for ${KERNEL_VER} (${ADIOS_FILE}) — soft-skipping ADIOS, build continues without it"
             mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-            patch -p1 --forward < /tmp/adios.patch > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1 || true
-            find . -name '*.rej' -newer /tmp/adios.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; 2>/dev/null || true
-            find . -name '*.rej' -newer /tmp/adios.patch -delete 2>/dev/null || true
+            {
+              echo "=== ADIOS probe FAILED for kernel ${KERNEL_VER} (${ADIOS_FILE}) ==="
+              echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
+              patch -p1 --dry-run --forward < /tmp/adios.patch 2>&1 || true
+            } > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1
             echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
             echo "::endgroup::"
             exit 0
@@ -1989,17 +1991,21 @@ runs:
         
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
           echo "Patching clear_page_16bytes_align.patch"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
-            echo "::warning::clear_page_16bytes_align patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
+          if patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
+            patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
+          else
+            echo "::warning::clear_page_16bytes_align patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_dryrun.log" 2>&1 || true
           fi
         else
           echo "Patching clear_page_16bytes_align.patch (sed variant)"
-          if ! cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward; then
-            echo "::warning::clear_page_16bytes_align (sed variant) patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
+          if cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward; then
+            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward
+          else
+            echo "::warning::clear_page_16bytes_align (sed variant) patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_sed_dryrun.log" 2>&1 || true
           fi
         fi
         
@@ -2071,10 +2077,12 @@ runs:
           exit 1
         fi
         echo "Patching use_unlikely_wrap_cpufreq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
-          echo "::warning::use_unlikely_wrap_cpufreq patch did not apply cleanly. Continuing without it (cpufreq optimization only)."
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          find . -name "*.rej" -delete 2>/dev/null || true
+        if patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
+          patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
+        else
+          echo "::warning::use_unlikely_wrap_cpufreq patch does not apply for this tree - skipping WITHOUT touching the tree (cpufreq optimization only)"
+          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+          patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch" > "$GITHUB_WORKSPACE/patch-faillogs/use_unlikely_wrap_cpufreq_dryrun.log" 2>&1 || true
         fi
         
         echo "✅ Other patches applied"
@@ -2268,9 +2276,11 @@ runs:
         if ! patch -p1 --dry-run --forward < /tmp/bore.patch; then
           echo "::warning::BoRE patch does not apply for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) — soft-skipping BoRE, build continues without it"
           mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-          patch -p1 --forward < /tmp/bore.patch > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1 || true
-          find . -name '*.rej' -newer /tmp/bore.patch -exec cp {} "$GITHUB_WORKSPACE/patch-faillogs/" \; 2>/dev/null || true
-          find . -name '*.rej' -newer /tmp/bore.patch -delete 2>/dev/null || true
+          {
+            echo "=== BoRE probe FAILED for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) ==="
+            echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
+            patch -p1 --dry-run --forward < /tmp/bore.patch 2>&1 || true
+          } > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0

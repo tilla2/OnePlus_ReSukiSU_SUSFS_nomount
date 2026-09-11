@@ -2273,19 +2273,19 @@ runs:
         BORE_PATCH="bore_${KERNEL_VER}.patch"
         curl -sSL --fail -o /tmp/bore.patch \
           "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}"
-        if ! patch -p1 --dry-run --forward < /tmp/bore.patch; then
+        if ! patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch; then
           echo "::warning::BoRE patch does not apply for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) — soft-skipping BoRE, build continues without it"
           mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
           {
             echo "=== BoRE probe FAILED for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) ==="
             echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
-            patch -p1 --dry-run --forward < /tmp/bore.patch 2>&1 || true
+            patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch 2>&1 || true
           } > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
         fi
-        patch -p1 --forward < /tmp/bore.patch
+        patch -p1 --forward --fuzz=0 < /tmp/bore.patch
         grep -q 'config SCHED_BORE' init/Kconfig
         grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig

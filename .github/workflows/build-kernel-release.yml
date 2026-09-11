@@ -1227,6 +1227,10 @@ jobs:
           # build-time helper and must never become a release asset, so drop it
           # before notes generation / asset upload. The ccache download-once
           # mechanism (prepare_ccache job + ccache-binary artifact) is untouched.
+          # download-artifact can land payloads inside per-artifact subdirs;
+          # hoist every file to the staging root so discovery below is version-proof
+          find ./downloaded-artifacts -mindepth 2 -type f -exec mv -f {} ./downloaded-artifacts/ \; 2>/dev/null || true
+          find ./downloaded-artifacts -mindepth 1 -type d -empty -delete 2>/dev/null || true
           rm -f ./downloaded-artifacts/ccache*
           rm -f ./downloaded-artifacts/*.rej ./downloaded-artifacts/*.log
           ls -A ./downloaded-artifacts
@@ -1236,9 +1240,12 @@ jobs:
         run: |
           set -euo pipefail
           cd ./downloaded-artifacts
-          kernel_count="$(find . -maxdepth 1 -type f -name "AK3_*.zip" | wc -l)"
+          kernel_count="$(find . -type f -name "AK3_*.zip" | wc -l)"
           if [ "$kernel_count" -eq 0 ]; then
             echo "::error::No kernel artifacts were produced; refusing to create a release."
+            echo "::group::Staging diagnostics"
+            find . -maxdepth 3 -print | head -80
+            echo "::endgroup::"
             exit 1
           fi
 
@@ -1268,7 +1275,11 @@ jobs:
 
           if ! ls ./*.apk >/dev/null 2>&1; then
             echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
-            LATEST_TAG=$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name')
+            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            if [ -z "$LATEST_TAG" ]; then
+              echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
+              exit 1
+            fi
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/releases/tag/${LATEST_TAG}" >> "$GITHUB_ENV"
             for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
               --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
@@ -1290,7 +1301,7 @@ jobs:
 
           # NoMount module (always built from source now) — provenance verification
           echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
-          MODULE_ZIP="$(find . -maxdepth 1 -name 'NoMount-*.zip' | head -n1)"
+          MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
           [ -n "$MODULE_ZIP" ] || { echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"; exit 1; }
           if [ -f "${MODULE_ZIP}.sha256" ]; then
             sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }

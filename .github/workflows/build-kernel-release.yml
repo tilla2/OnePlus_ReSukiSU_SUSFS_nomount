@@ -1215,25 +1215,33 @@ jobs:
         with:
           path: ./downloaded-artifacts
           merge-multiple: true
+          skip-decompress: true
           pattern: "{AK3_*,NoMount-*,nomount-*,matrix.json,patch-status-*}"
           digest-mismatch: warn
 
-      - name: 🧹 Exclude ccache binary from release staging
+      - name: 🧹 Prepare release staging
         run: |
           mkdir -p ./downloaded-artifacts
-          # merge-multiple pulls every run artifact (including the shared
-          # ccache-binary) into ./downloaded-artifacts. The ccache binary is a
-          # build-time helper and must never become a release asset, so drop it
-          # before notes generation / asset upload. The ccache download-once
-          # mechanism (prepare_ccache job + ccache-binary artifact) is untouched.
-          # download-artifact can land payloads inside per-artifact subdirs;
-          # hoist every file to the staging root so discovery below is version-proof
           find ./downloaded-artifacts -mindepth 2 -type f -exec mv -f {} ./downloaded-artifacts/ \; 2>/dev/null || true
           find ./downloaded-artifacts -mindepth 1 -type d -empty -delete 2>/dev/null || true
           rm -f ./downloaded-artifacts/ccache*
           rm -f ./downloaded-artifacts/*.rej ./downloaded-artifacts/*.log
+          for z in ./downloaded-artifacts/*.zip; do
+            [ -f "$z" ] || continue
+            case "$(basename "$z")" in
+              AK3_*|NoMount-*) continue ;;
+            esac
+            echo "Unwrapping containerized artifact: $(basename "$z")"
+            if unzip -o -q "$z" -d ./downloaded-artifacts 2>/dev/null; then
+              rm -f "$z"
+            else
+              echo "::warning::Could not unwrap $(basename "$z"); leaving it untouched"
+            fi
+          done
+          find ./downloaded-artifacts -mindepth 2 -type f -exec mv -f {} ./downloaded-artifacts/ \; 2>/dev/null || true
+          find ./downloaded-artifacts -mindepth 1 -type d -empty -delete 2>/dev/null || true
           ls -A ./downloaded-artifacts
-          echo "✅ ccache binary excluded from release staging"
+          echo "✅ Release staging prepared"
 
       - name: 📦 Fetch commit-matched manager apps
         run: |

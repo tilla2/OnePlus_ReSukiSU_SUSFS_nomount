@@ -1219,7 +1219,7 @@ jobs:
         with:
           path: ./downloaded-artifacts
           merge-multiple: true
-          pattern: "{AK3_*,nomount-module-*,build-matrix}"
+          pattern: "{AK3_*,NoMount-*,nomount-*,matrix.json}"
           skip-decompress: true
           digest-mismatch: warn
 
@@ -1306,7 +1306,13 @@ jobs:
           # NoMount module (always built from source now) — provenance verification
           echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
           MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
-          [ -n "$MODULE_ZIP" ] || { echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"; exit 1; }
+          if [ -z "$MODULE_ZIP" ]; then
+            echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"
+            echo "::group::Staging diagnostics"
+            find . -maxdepth 2 -print | head -80
+            echo "::endgroup::"
+            exit 1
+          fi
           if [ -f "${MODULE_ZIP}.sha256" ]; then
             sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
             echo "✅ Built module SHA256 verified (sidecar)"

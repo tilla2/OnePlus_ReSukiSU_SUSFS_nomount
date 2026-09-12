@@ -125,7 +125,9 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
-        PS_BASE="$(echo "${OP_MODEL:-unknown}" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${OP_OS_VERSION:-unknown}"
+        P_MODEL="$(jq -r '.model // "unknown"' /tmp/config.json)"
+        P_OSVER="$(jq -r '.os_version // "unknown"' /tmp/config.json)"
+        PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
         echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
         echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
         if [ -z "${OP_BORE:-}" ]; then

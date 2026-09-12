@@ -1471,6 +1471,7 @@ jobs:
           else
             echo "::error::No device info found!" >&2
             exit 1
+          fi
           MANAGER_SRC="${MANAGER_RUN_URL:-}"
           
           cat << EOF >> release_notes.md

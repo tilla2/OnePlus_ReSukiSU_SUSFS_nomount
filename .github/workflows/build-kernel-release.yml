@@ -1546,6 +1546,8 @@ jobs:
           done)
           EOF
 
+          cat << EOF >> release_notes.md
+
           ### 📌 NoMount Integration
 
           | Component | Value |
@@ -1593,7 +1595,7 @@ jobs:
           - **NoMount** - Kernel-side integration from [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
           EOF
           
-          if [ "${ksu_ver_global:-0}" -lt 12884 ]; then
+          if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "${ksu_ver_global}" -lt 12884 ]; then
             cat << EOF >> release_notes.md
           - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
           EOF

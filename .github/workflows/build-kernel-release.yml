@@ -1219,9 +1219,17 @@ jobs:
         with:
           path: ./downloaded-artifacts
           merge-multiple: true
+          pattern: |
+            AK3_*
+            nomount-module-*
+            build-matrix
+          skip-decompress: true
+          digest-mismatch: warn
+        continue-on-error: true
 
       - name: 🧹 Exclude ccache binary from release staging
         run: |
+          mkdir -p ./downloaded-artifacts
           # merge-multiple pulls every run artifact (including the shared
           # ccache-binary) into ./downloaded-artifacts. The ccache binary is a
           # build-time helper and must never become a release asset, so drop it

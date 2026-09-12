@@ -1463,12 +1463,6 @@ jobs:
           else
             echo "::error::No device info found!" >&2
             exit 1
-          fi
-          case "$ksu_type" in
-            KSUN) root_release_label="KernelSU Next v3.3.0" ;;
-            ReSukiSU) root_release_label="ReSukiSU $ksu_ver_global" ;;
-            KSU) root_release_label="KernelSU $ksu_ver_global" ;;
-          esac
           MANAGER_SRC="${MANAGER_RUN_URL:-}"
           
           cat << EOF >> release_notes.md
@@ -1523,50 +1517,100 @@ jobs:
             echo "| $key | \`${susfs_map[$key]:-unknown}\` |"
           done)
           EOF
-
           cat << EOF >> release_notes.md
 
           ---
 
-          > **NoMount:** kernel-side and userspace module both from [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
-          > **Integrity:** every release asset is listed in \`SHA256SUMS.txt\` — verify before flashing
+          ## ✨ Features & Capabilities
+
+          ### 🔐 Root Management
+          EOF
+          if [ "$ksu_type" == "KSUN" ]; then
+            cat << EOF >> release_notes.md
+          - **KernelSU Next** - Kernel-level root integration
+          EOF
+          elif [ "$ksu_type" == "ReSukiSU" ]; then
+            cat << EOF >> release_notes.md
+          - **ReSukiSU** - Kernel-based Android root integration
+          EOF
+          elif [ "$ksu_type" == "KSU" ]; then
+            cat << EOF >> release_notes.md
+          - **KernelSU** - Kernel-level root solution
+          EOF
+          fi
+          cat << EOF >> release_notes.md
+          - **SUSFS** - Advanced hiding and security features
+          - **NoMount** - Kernel-side integration from [`$NM_SHA`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
+          EOF
+          if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "${ksu_ver_global}" -lt 12884 ]; then
+            cat << EOF >> release_notes.md
+          - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
+          EOF
+          fi
+          cat << EOF >> release_notes.md
+
+          ### 🛡️ Security & Privacy
+          - **Baseband Guard (BBG)** - LSM-based baseband security
+          - **SUSFS Hide Features**:
+            - ✅ SUS_PATH - Hide suspicious paths
+            - ✅ SUS_MOUNT - Hide mount points (No Cli Support)
+            - ✅ SUS_KSTAT - Spoof kernel statistics
+            - ✅ SPOOF_UNAME - Kernel version spoofing
+            - ✅ SPOOF_CMDLINE - Boot parameters spoofing
+            - ✅ OPEN_REDIRECT - File access redirection
+            - ✅ SUS_MAP - Memory mapping protection
+            - ✅ AVC_SPOOF - Spoof Procfs avc denial logs
+          - **Ptrace Leak Fix** - For kernels < 5.16
+          - **Unicode Fix** - Prevent path traversal and other detections using non-printable Unicode codepoints [Experimental]
+
+          ### 🚀 Performance & Networking
+          - **BBR with FQ/FQ-CoDel** - TCP congestion-control and queueing support
+          - **IPSet & IPv6 NAT** - IP set matching, IPv6 masquerading, and NAT support
+          - **TTL / hop-limit targets** - IPv4 TTL and IPv6 hop-limit Netfilter targets
+          - **Per-device LTO** - Enabled only where the device configuration supports it
+          - **Performance tuning** - Memory, I/O, CPU-frequency, scheduler, storage, network, and log-spam improvements
+
+          ### 🔧 System Features
+          - **TMPFS_XATTR** - Extended attributes for tmpfs (Mountify support)
+          - **TMPFS_POSIX_ACL** - POSIX ACLs for tmpfs
+          - **Module intercept and overlay mechanism** - Device-specific module overlay support
+          - **Droidspaces** - Portable Linux container prerequisites
+          - **NTSync** - Windows NT synchronization primitives for compatible userspace
+          - **USB DWC3 / OTG** - Dual-role USB, gadget, Type-C, and device-specific PHY support
 
           ---
 
-          EOF
-          
           ## 📱 ${ROOT_DISPLAY:-$ksu_type} Manager
 
-          - Commit-exact manager build for this release: [\`${KSU_SHA:0:12}\`](${MANAGER_SRC})
+          - Commit-exact manager build for this release: [`${KSU_SHA:0:12}`](${MANAGER_SRC})
           - Required SUSFS module: [sidex15/ksu_module_susfs](https://github.com/sidex15/ksu_module_susfs/releases)
           - Recommended flasher: [Kernel Flasher](https://github.com/fatalcoder524/KernelFlasher/releases)
-          
+
           ---
-          
+
           ## 📥 Installation Instructions
-          
+
           ### Prerequisites
           - Unlocked bootloader.
           - Backup your current boot image.
           - Have root access using Magisk / KernelSU / Apatch (Any forks).
-          
+
           ### Via Kernel Flasher
           1. Download the appropriate ZIP for your device.
           2. Flash the ZIP file using Kernel Flasher.
           3. Reboot system.
           4. Install the ${ROOT_DISPLAY:-$ksu_type} manager.
-          
+
           ---
-          
+
           ## 📜 Changelog
-          
+
           ### This Release
-          - $root_release_label, SUSFS $SUSFS_BASE_VERSION, NoMount ($NM_MODE) at \`$NM_SHA\`.
           - Per-device Features in the table above reflect only what actually applied in this build.
-          
+
           ### Previous Releases
           See [Releases Page](${{ github.server_url }}/${{ github.repository }}/releases)
-          
+
           ---
 
           ## 🙏 Credits

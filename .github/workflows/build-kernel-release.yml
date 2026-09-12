@@ -1323,7 +1323,7 @@ jobs:
             exit 1
           fi
           echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
-          sha256sum ./*.zip ./*.apk > SHA256SUMS.txt
+          sha256sum ./AK3_*.zip ./NoMount-*.zip ./*.apk > SHA256SUMS.txt
 
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
@@ -1732,7 +1732,8 @@ jobs:
 
       - name: 📤 Upload Release Assets Dynamically
         run: |
-          for file in ./downloaded-artifacts/*.zip; do
+          shopt -s nullglob
+          for file in ./downloaded-artifacts/AK3_*.zip ./downloaded-artifacts/NoMount-*.zip; do
             if [ -f "$file" ]; then
               echo "Uploading $file..."
               gh release upload "${{ env.NEW_TAG }}" "$file" --clobber
@@ -1766,7 +1767,8 @@ jobs:
           ### 📦 Assets
           EOF
           
-          for zip in ./downloaded-artifacts/*.zip; do
+          shopt -s nullglob
+          for zip in ./downloaded-artifacts/AK3_*.zip ./downloaded-artifacts/NoMount-*.zip; do
             if [ -f "$zip" ]; then
               name=$(basename "$zip")
               size=$(stat -c%s "$zip")

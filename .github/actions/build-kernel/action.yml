@@ -125,6 +125,9 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        PS_BASE="$(echo "${OP_MODEL:-unknown}" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${OP_OS_VERSION:-unknown}"
+        echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
+        echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
         if [ -z "${OP_BORE:-}" ]; then
           echo "OP_BORE=true" >> "$GITHUB_ENV"
         fi
@@ -908,11 +911,10 @@ runs:
         git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
         NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
         if [ -z "$NOMOUNT_TARGET" ]; then
-          NOMOUNT_TARGET="1dacddf5d85ced5b6c26ab09e621e366e4f0cd88"
-          echo "No NoMount commit provided; using built-in known-good pin: $NOMOUNT_TARGET"
-        else
-          echo "Using caller-resolved NoMount commit: $NOMOUNT_TARGET"
+          echo "::error::No NoMount commit resolved upstream and none was provided"
+          exit 1
         fi
+        echo "Using NoMount commit: $NOMOUNT_TARGET"
         git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
         git -C nomount checkout --detach "$NOMOUNT_TARGET"
         NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
@@ -1019,12 +1021,10 @@ runs:
         cd "$KERNEL_PLATFORM_FOLDER"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
         if [ -z "$KSU_INPUT" ]; then
-          KSU_INPUT="3b18216f71df189ab3d1b1ce0bdb21be1268e771"
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -
+        else
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
         fi
-
-        curl --fail --location --proto '=https' -LSs \
-          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/3b18216f71df189ab3d1b1ce0bdb21be1268e771/kernel/setup.sh" \
-          | bash -s "$KSU_INPUT"
         git -C KernelSU-Next submodule update --init --recursive
         cd KernelSU-Next/kernel
 
@@ -1060,7 +1060,7 @@ runs:
         echo "✅ KernelSU Next added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
-    - name: Add ReSukiSU (The Sukisaku Project)
+    - name: Add ReSukiSU
       shell: bash
       if: ${{ inputs.ksu_type == 'ReSukiSU' }}
       run: |
@@ -1574,6 +1574,7 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+        echo "susfs|applied" >> "$PS_FILE"
         
         echo "::endgroup::"
     
@@ -1631,6 +1632,7 @@ runs:
         ls -la "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
         echo "✅ NoMount integration completed"
+        echo "nomount|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)
@@ -1653,6 +1655,7 @@ runs:
         echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
         echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
         echo "LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+        echo "lz4|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Enable ADIOS I/O Scheduler
@@ -1677,6 +1680,7 @@ runs:
               patch -p1 --dry-run --forward < /tmp/adios.patch 2>&1 || true
             } > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1
             echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
+            echo "adios|skipped" >> "$PS_FILE"
             echo "::endgroup::"
             exit 0
           fi
@@ -1694,6 +1698,7 @@ runs:
         echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
         echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
         echo "ADIOS I/O scheduler enabled"
+        echo "adios|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -1719,6 +1724,7 @@ runs:
           fi
         fi
         echo "✅ BBG LSM added"
+        echo "bbg|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply KSU Hooks
@@ -1735,6 +1741,7 @@ runs:
           exit 1
         fi
         echo "✅ KSU hooks applied"
+        echo "ksu_hooks|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply Other Patches
@@ -1808,6 +1815,7 @@ runs:
             find . -name "*.rej" -delete 2>/dev/null || true
           fi
         else
+          echo "hmbird|applied" >> "$PS_FILE"
           echo "Hmbird not enabled, skipping fengchi patch"
         fi
 
@@ -2164,6 +2172,7 @@ runs:
         CONFIG_NTSYNC=y
         EOF
         echo "✅ NTSync patch applied"
+        echo "ntsync|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply Unicode Fix Patch
@@ -2190,6 +2199,7 @@ runs:
               exit 1
             fi
         fi
+        echo "unicode|applied" >> "$PS_FILE"
 
     - name: Add Tmpfs Support
       shell: bash
@@ -2214,6 +2224,7 @@ runs:
         CONFIG_NET_SCH_FQ=y
         CONFIG_NET_SCH_FQ_CODEL=y
         EOF
+        echo "bbr|applied" >> "$PS_FILE"
 
     - name: Apply BBRv3
       if: ${{ env.OP_BBR3 == 'true' }}
@@ -2259,6 +2270,7 @@ runs:
           echo 'CONFIG_TCP_CONG_BBR3=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
         echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
+        echo "bbrv3|applied" >> "$PS_FILE"
         echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
         echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
@@ -2282,6 +2294,7 @@ runs:
             patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch 2>&1 || true
           } > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "bore|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
         fi
@@ -2291,6 +2304,7 @@ runs:
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
         echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
+        echo "bore|applied" >> "$PS_FILE"
         echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
         echo "BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
@@ -2306,6 +2320,7 @@ runs:
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
+        echo "ttl|applied" >> "$PS_FILE"
 
     - name: Add IP SET & IPv6_NAT Support
       if: ${{ env.OP_IP_SET == 'true' }}
@@ -2353,6 +2368,7 @@ runs:
           find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
           exit 1
         fi
+        echo "ip_set|applied" >> "$PS_FILE"
     
     - name: Add USB DWC3 & OTG Support
       shell: bash
@@ -2390,7 +2406,7 @@ runs:
 
     - name: Add LXC / Droidspaces support
       shell: bash
-      if: ${{ env.OP_LXC_DS == 'true' }}
+      if: ${{ env.OP_LXC_DS == 'true' && env.OP_DS != 'true' }}
       run: |
         set -euo pipefail
         echo "Add Droidspaces Support"
@@ -2409,6 +2425,7 @@ runs:
         CONFIG_PID_NS = y
         CONFIG_POSIX_MQUEUE = y
         EOF
+        echo "ds|applied" >> "$PS_FILE"
 
     - name: Add Droidspaces support
       shell: bash
@@ -2494,6 +2511,7 @@ runs:
         fi
         
         echo "✅ Droidspaces Support applied"
+        echo "ds|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add Build based configs
@@ -2646,6 +2664,15 @@ runs:
         name: patch-dry-run-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}
         path: ${{ env.DEBUG_ARTIFACTS_DIR }}/patch_dry_run_*.txt
         if-no-files-found: error
+        retention-days: 7
+
+    - name: Upload patch status
+      if: ${{ always() && env.PS_FILE != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-status-${{ env.PS_BASE }}
+        path: ${{ env.PS_FILE }}
+        if-no-files-found: ignore
         retention-days: 7
 
     - name: Stop before build (dry run)
@@ -3069,6 +3096,8 @@ runs:
       run: |
         set -euo pipefail
         
+        pstat() { local v; v="$(awk -F'|' -v k="$1" '$1==k{print $2}' "$PS_FILE" 2>/dev/null || true)"; echo "${v:-not requested}"; }
+
         # Get commit SHAs with fallback
         KSU_SHA="${KSU_COMMIT_SHA:-unknown}"
         SUSFS_SHA="${SUSFS_COMMIT_SHA:-unknown}"
@@ -3096,16 +3125,21 @@ runs:
           echo "Optimization: ${{ inputs.optimize_level }}"
           echo "Clean Build: ${{ inputs.clean }}"
           echo ""
-          echo "=== OnePlus Features ==="
-          echo "BBR: ${{ env.OP_BBR }}"
-          echo "BBG: ${{ env.OP_BBG }}"
-          echo "BoRE: ${{ env.OP_BORE }}"
-          echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
-          echo "TTL: ${{ env.OP_TTL }}"
-          echo "IP_SET & IPv6 NAT: ${{ env.OP_IP_SET }}"
-          echo "Unicode Fix: ${{ env.OP_UNICODE }}"
-          echo "NTSync: ${{ env.OP_NTSYNC }}"
-          echo "Droidspaces: ${{ env.OP_DS }}"
+          echo "=== Patch Status (actual application results) ==="
+          echo "SusFS: $(pstat susfs)"
+          echo "BBR: $(pstat bbr)"
+          echo "BBRv3: $(pstat bbrv3)"
+          echo "BoRE: $(pstat bore)"
+          echo "ADIOS: $(pstat adios)"
+          echo "BBG: $(pstat bbg)"
+          echo "HMBIRD SCX: $(pstat hmbird)"
+          echo "TTL: $(pstat ttl)"
+          echo "IP_SET & IPv6 NAT: $(pstat ip_set)"
+          echo "Unicode Fix: $(pstat unicode)"
+          echo "NTSync: $(pstat ntsync)"
+          echo "Droidspaces: $(pstat ds)"
+          echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
+          echo "NoMount: $(pstat nomount)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
@@ -3160,19 +3194,24 @@ runs:
           fi
           
           echo ""
-          echo "### 🔧 OnePlus Features"
+          echo "### 🔧 Patch Status (actual application results)"
           echo ""
           echo "| Feature | Status |"
           echo "|---------|--------|"
-          echo "| **BBR** | ${{ env.OP_BBR }} |"
-          echo "| **BBG** | ${{ env.OP_BBG }} |"
-          echo "| **BoRE** | ${{ env.OP_BORE }} |"
-          echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
-          echo "| **TTL** | ${{ env.OP_TTL }} |"
-          echo "| **IP_SET & IPv6 NAT** | ${{ env.OP_IP_SET }} |"
-          echo "| **Unicode Fix** | ${{ env.OP_UNICODE }} |"
-          echo "| **NTSync** | ${{ env.OP_NTSYNC }} |"
-          echo "| **Droidspaces** | ${{ env.OP_DS }} |"
+          echo "| **SusFS** | $(pstat susfs) |"
+          echo "| **BBR** | $(pstat bbr) |"
+          echo "| **BBRv3** | $(pstat bbrv3) |"
+          echo "| **BoRE** | $(pstat bore) |"
+          echo "| **ADIOS** | $(pstat adios) |"
+          echo "| **BBG** | $(pstat bbg) |"
+          echo "| **HMBIRD SCX** | $(pstat hmbird) |"
+          echo "| **TTL** | $(pstat ttl) |"
+          echo "| **IP_SET & IPv6 NAT** | $(pstat ip_set) |"
+          echo "| **Unicode Fix** | $(pstat unicode) |"
+          echo "| **NTSync** | $(pstat ntsync) |"
+          echo "| **Droidspaces** | $(pstat ds) |"
+          echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
+          echo "| **NoMount** | $(pstat nomount) |"
           
           echo ""
           echo "### 📊 Build Metrics"

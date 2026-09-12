@@ -1107,7 +1107,7 @@ runs:
         MANAGER_BRANCH="${{ inputs.ksu_branch_or_hash }}"
         [ -z "$MANAGER_BRANCH" ] && MANAGER_BRANCH="main"
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-        CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-${OP_ROOT_TAG}@${MANAGER_BRANCH}[%COMMIT_SHA%]"
+        CONFIG_KSU_FULL_NAME_FORMAT="${OP_ROOT_TAG}@%REPO_NAME%"
         EOF
         grep -n 'CONFIG_KSU_FULL_NAME_FORMAT' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         echo "ROOT_TAG_APPLIED=${OP_ROOT_TAG}" >> "$GITHUB_ENV"
@@ -2578,7 +2578,7 @@ runs:
         echo "Customize Kernel Branding"
         cd "$COMMON_KERNEL_FOLDER"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}-${{ github.actor }}"
+        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
 
     - name: Disable GPUEB

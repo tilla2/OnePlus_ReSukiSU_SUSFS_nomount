@@ -1216,7 +1216,6 @@ jobs:
           path: ./downloaded-artifacts
           merge-multiple: true
           pattern: "{AK3_*,NoMount-*,nomount-*,matrix.json,patch-status-*}"
-          skip-decompress: true
           digest-mismatch: warn
 
       - name: 🧹 Exclude ccache binary from release staging
@@ -1333,16 +1332,6 @@ jobs:
           # Collect build metadata
           declare -A device_info
           
-          # Defensive: if matrix.json ever arrives as a zip container, jq would die
-          # with exit 2. Unwrap it, then fail loudly instead of silently.
-          if [ -f ./downloaded-artifacts/matrix.json ] && head -c 2 ./downloaded-artifacts/matrix.json | grep -q PK; then
-            echo "::warning::matrix.json arrived as a zip container; unwrapping it"
-            mv ./downloaded-artifacts/matrix.json ./downloaded-artifacts/matrix.json.zip
-            unzip -o ./downloaded-artifacts/matrix.json.zip -d ./downloaded-artifacts
-          fi
-          [ -f ./downloaded-artifacts/matrix.json ] || { echo "::error::matrix.json artifact missing after download; cannot generate release notes"; exit 1; }
-          jq -e . ./downloaded-artifacts/matrix.json > /dev/null || { echo "::error::matrix.json is not valid JSON after download"; exit 1; }
-          JSON_BUILD_DATA=$(jq -c '.' ./downloaded-artifacts/matrix.json)
           
           for file in $(find downloaded-artifacts -maxdepth 1 -name "AK3_*.zip" -type f | sort); do
             if [ -f "$file" ]; then
@@ -1404,20 +1393,16 @@ jobs:
             
             IFS='|' read -r model os_ver kernel_ver _ _ _ zipfile <<< "${device_info["$full_key"]}"
             
-            # Use jq to extract feature flags for this model from the JSON matrix.
-            # Reconstruct the original model name (e.g. OP13r-6.1.118) in case the ZIP
-            # had the kernel version suffix stripped for display. Try exact ORIG_MODEL
-            # first, fall back to base MODEL, both filtered by os_version.
-            full_kv=$(echo "$kernel_ver" | sed 's/^[^-]*-//')
-            possible_orig_model="${model}-${full_kv}"
-            feature_flags=$(jq -r --arg MODEL "$model" --arg ORIG_MODEL "$possible_orig_model" --arg OS "$os_ver" '
-              ([ .[] | select(.model == $ORIG_MODEL and .os_version == $OS) ][0]) //
-              ([ .[] | select(.model == $MODEL      and .os_version == $OS) ][0]) |
-              "\(.hmbird // false)\t\(.susfs // false)\t\(.bbr // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)\t\(.bbr3 // false)\t\(.bore // false)\t\(.lz4_upgrade // false)\t\(.adios // false)"
-            ' <<< "$JSON_BUILD_DATA")
-            
             features=()
             status_file="./downloaded-artifacts/patch-status-${model}_${os_ver}.txt"
+            if [[ ! -f "$status_file" ]]; then
+              status_file="$(find ./downloaded-artifacts -maxdepth 2 -name "patch-status-${model}_${os_ver}.txt" 2>/dev/null | head -n1 || true)"
+            fi
+            if [[ ! -f "$status_file" && -f "./downloaded-artifacts/patch-status-${model}_${os_ver}.zip" ]]; then
+              echo "::warning::patch-status-${model}_${os_ver} arrived as a zip container; unwrapping"
+              unzip -o -q "./downloaded-artifacts/patch-status-${model}_${os_ver}.zip" -d ./downloaded-artifacts 2>/dev/null || true
+              status_file="$(find ./downloaded-artifacts -maxdepth 2 -name "patch-status-${model}_${os_ver}.txt" 2>/dev/null | head -n1 || true)"
+            fi
             if [[ -f "$status_file" ]]; then
               while IFS='|' read -r patch_key patch_status; do
                 [[ "$patch_status" == "applied" ]] || continue
@@ -1437,48 +1422,27 @@ jobs:
                   adios) features+=("🧭 ADIOS") ;;
                 esac
               done < "$status_file"
-            elif [[ -z "$feature_flags" ]]; then
-              echo "Warning: No JSON entry found for model: $model" >&2
+            else
+              echo "::warning::patch status file missing for ${model}_${os_ver}; Features column will show N/A"
+            fi
+
+            total=${#features[@]}
+            if [ "$total" -eq 0 ]; then
               features_str="N/A"
             else
-              IFS=$'\t' read -r hmbird susfs bbr bbg ttl ip_set unicode ds ntsync bbr3 bore lz4_upgrade adios <<< "$feature_flags"
-              
-              # Build features string based on boolean values
-              [[ "$hmbird" == "true" ]] && features+=("🐦 HMBIRD")
-              [[ "$susfs" == "true" ]] && features+=("ඞ SusFS")
-              [[ "$bbr" == "true" ]] && features+=("🚀 BBR")
-              [[ "$bbg" == "true" ]] && features+=("🛡️ BBG")
-              [[ "$ttl" == "true" ]] && features+=("🌐 TTL")
-              [[ "$ip_set" == "true" ]] && features+=("🧱 IP_SET & IPv6 NAT")
-              [[ "$unicode" == "true" ]] && features+=("🔧 Unicode Fix")
-              [[ "$ds" == "true" ]] && features+=("💻 Droidspaces")
-              [[ "$ntsync" == "true" ]] && features+=("🔃 NTSync")
-              [[ "$bbr3" == "true" ]] && features+=("🚀 BBRv3")
-              [[ "$bore" == "true" ]] && features+=("🌀 BoRE")
-              [[ "$lz4_upgrade" == "true" ]] && features+=("⚡ LZ4 1.10.0 + ARMv8 NEON")
-              [[ "$adios" == "true" ]] && features+=("🧭 ADIOS")
-              
-              total=${#features[@]}
-              if [ $total -eq 0 ]; then
-                features_str="N/A"
-              else
-                features_str=""
-                count=0
-                
-                for item in "${features[@]}"; do
-                  count=$((count + 1))
-                  
-                  features_str+="$item"
-                  
-                  if [ $count -lt $total ]; then
-                    if [ $((count % 3)) -eq 0 ]; then
-                      features_str+="<br>"
-                    else
-                      features_str+="   "
-                    fi
+              features_str=""
+              count=0
+              for item in "${features[@]}"; do
+                count=$((count + 1))
+                features_str+="$item"
+                if [ "$count" -lt "$total" ]; then
+                  if [ $((count % 3)) -eq 0 ]; then
+                    features_str+="<br>"
+                  else
+                    features_str+="   "
                   fi
-                done
-              fi
+                fi
+              done
             fi
             
             if [[ "$os_ver" =~ ^OOS[0-9]+$ ]]; then
@@ -1505,7 +1469,6 @@ jobs:
             ReSukiSU) root_release_label="ReSukiSU $ksu_ver_global" ;;
             KSU) root_release_label="KernelSU $ksu_ver_global" ;;
           esac
-          MANAGER_NAMES="${MANAGER_APK_NAMES:-unknown}"
           MANAGER_SRC="${MANAGER_RUN_URL:-}"
           
           cat << EOF >> release_notes.md
@@ -1563,101 +1526,20 @@ jobs:
 
           cat << EOF >> release_notes.md
 
-          ### 📌 NoMount Integration
+          ---
 
-          | Component | Value |
-          |-----------|-------|
-          | Kernel-side commit | [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) — $NM_MODE, locked for all kernels in this run |
-
-          EOF
-
-          if [ "$NM_BUILT" = "true" ]; then
-            cat << EOF >> release_notes.md
-          | Userspace module | [\`$NM_MODULE_NAME.zip\`](https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${NEW_TAG}/${NM_MODULE_NAME}.zip) — built from source in this run (zig cc, static, arm64+arm) from exactly this commit |
-          | Module build | [This workflow run](${GITHUB_SERVER_URL}/${REPO_OWNER}/${REPO_NAME}/actions/runs/${GITHUB_RUN_ID}) — source commit embedded in the zip as \`NOMOUNT_SOURCE_COMMIT\` |
-          EOF
-            if [ -n "$NM_RUN_URL" ]; then
-              cat << EOF >> release_notes.md
-          | Upstream CI reference | [$NM_RUN_URL]($NM_RUN_URL) |
-          EOF
-            fi
-          fi
-
-          cat << EOF >> release_notes.md
-          > The bundled module ZIP always matches the kernel-side NoMount commit above — kernel and userspace can never drift within a release.
+          > **NoMount:** kernel-side and userspace module both from [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
+          > **Integrity:** every release asset is listed in \`SHA256SUMS.txt\` — verify before flashing
 
           ---
 
-          ## ✨ Features & Capabilities
+          EOF
+          
+          ## 📱 ${ROOT_DISPLAY:-$ksu_type} Manager
 
-          ### 🔐 Root Management
-          EOF
-          if [ "$ksu_type" == "KSUN" ]; then
-            cat << EOF >> release_notes.md
-          - **KernelSU Next** - Kernel-level root integration
-          EOF
-          elif [ "$ksu_type" == "ReSukiSU" ]; then
-            cat << EOF >> release_notes.md
-          - **ReSukiSU** - Kernel-based Android root integration
-          EOF
-          elif [ "$ksu_type" == "KSU" ]; then
-            cat << EOF >> release_notes.md
-          - **KernelSU** - Kernel-level root solution
-          EOF
-          fi
-          cat << EOF >> release_notes.md
-          - **SUSFS $SUSFS_BASE_VERSION** - Advanced hiding and security features
-          - **NoMount** - Kernel-side integration from [\`$NM_SHA\`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
-          EOF
-          
-          if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "${ksu_ver_global}" -lt 12884 ]; then
-            cat << EOF >> release_notes.md
-          - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
-          EOF
-          fi
-          cat << EOF >> release_notes.md
-          ### 🛡️ Security & Privacy
-          - **Baseband Guard (BBG)** - LSM-based baseband security
-          - **SUSFS Hide Features**:
-            - ✅ SUS_PATH - Hide suspicious paths
-            - ✅ SUS_MOUNT - Hide mount points (No Cli Support)
-            - ✅ SUS_KSTAT - Spoof kernel statistics
-            - ✅ SPOOF_UNAME - Kernel version spoofing
-            - ✅ SPOOF_CMDLINE - Boot parameters spoofing
-            - ✅ OPEN_REDIRECT - File access redirection
-            - ✅ SUS_MAP - Memory mapping protection
-            - ✅ AVC_SPOOF - Spoof Procfs avc denial logs
-          - **Ptrace Leak Fix** - For kernels < 5.16
-          - **Unicode Fix** - Prevent path traversal and other detections using non-printable Unicode codepoints [Experimental]
-          
-          ### 🚀 Performance & Networking
-          - **BBR with FQ/FQ-CoDel** - TCP congestion-control and queueing support
-          - **IPSet & IPv6 NAT** - IP set matching, IPv6 masquerading, and NAT support
-          - **TTL / hop-limit targets** - IPv4 TTL and IPv6 hop-limit Netfilter targets
-          - **Per-device LTO** - Enabled only where the device configuration supports it
-          - **Performance tuning** - Memory, I/O, CPU-frequency, scheduler, storage, network, and log-spam improvements
-          
-          ### 🔧 System Features
-          - **TMPFS_XATTR** - Extended attributes for tmpfs (Mountify support)
-          - **TMPFS_POSIX_ACL** - POSIX ACLs for tmpfs
-          - **Module intercept and overlay mechanism** - Device-specific module overlay support
-          - **Droidspaces** - Portable Linux container prerequisites
-          - **NTSync** - Windows NT synchronization primitives for compatible userspace
-          - **USB DWC3 / OTG** - Dual-role USB, gadget, Type-C, and device-specific PHY support
-          
-          ---
-          
-          ## 📱 Manager Applications
-          
-          - **${ROOT_DISPLAY} Manager (commit-exact: \`${KSU_SHA:0:12}\`)**
-            → [Source build for this release](${MANAGER_SRC})
-          - **Included release assets:** ${MANAGER_NAMES}
-          ### Required Module
-          - **KSU SUSFS Module** (Required for SUSFS features)
-            → [GitHub Release](https://github.com/sidex15/ksu_module_susfs/releases)
-          ### Recommended Flasher
-          - **Kernel Flasher** (compatible with AnyKernel3 ZIPs, backups, and OTA)
-            → [GitHub Release](https://github.com/fatalcoder524/KernelFlasher/releases)
+          - Commit-exact manager build for this release: [\`${KSU_SHA:0:12}\`](${MANAGER_SRC})
+          - Required SUSFS module: [sidex15/ksu_module_susfs](https://github.com/sidex15/ksu_module_susfs/releases)
+          - Recommended flasher: [Kernel Flasher](https://github.com/fatalcoder524/KernelFlasher/releases)
           
           ---
           
@@ -1672,19 +1554,15 @@ jobs:
           1. Download the appropriate ZIP for your device.
           2. Flash the ZIP file using Kernel Flasher.
           3. Reboot system.
-          4. Install Manager Application.
+          4. Install the ${ROOT_DISPLAY:-$ksu_type} manager.
           
           ---
           
           ## 📜 Changelog
           
           ### This Release
-          - $root_release_label, SUSFS $SUSFS_BASE_VERSION, and NoMount dev integration.
-          - Per-device patch status reported from actual application results; BoRE, BBRv3 and ADIOS probe-first soft-skip.
-          - IPSet, IPv6 NAT, TTL / hop-limit targets, and BBR networking support.
-          - TMPFS XATTR / POSIX ACL, Droidspaces, NTSync, and USB OTG support.
-          - Ptrace compatibility for older kernel families and Unicode path handling fixes.
-          - Per-device compiler and LTO configuration with ${{ inputs.optimize_level }} optimization.
+          - $root_release_label, SUSFS $SUSFS_BASE_VERSION, NoMount ($NM_MODE) at \`$NM_SHA\`.
+          - Per-device Features in the table above reflect only what actually applied in this build.
           
           ### Previous Releases
           See [Releases Page](${{ github.server_url }}/${{ github.repository }}/releases)

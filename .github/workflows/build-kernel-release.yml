@@ -104,6 +104,11 @@ on:
         required: false
         type: boolean
         default: false
+      bump_release_increment:
+        description: 'Bump the release -r increment (otherwise the previous increment is reused)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   set-op-model:
@@ -543,7 +548,6 @@ jobs:
           - Create Release: ${{ inputs.make_release && '✅ Yes' || '❌ No' }}
           - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
-          - BoRE: per-device \`bore\` flag in configs/ (dry run remains global)
           
           **SUSFS Configuration:**
           EOF
@@ -613,7 +617,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::Resolve NoMount commit"
-          FALLBACK_PIN="1dacddf5d85ced5b6c26ab09e621e366e4f0cd88"
           branch="${{ inputs.nomount_branch }}"
           commit="${{ inputs.nomount_commit }}"
 
@@ -671,11 +674,9 @@ jobs:
               fi
               break
             done
-            # ── Mode 3: fallback — known-good pin, static verified ZIP ──
             if [ -z "$commit" ]; then
-              echo "::warning::No CI-verified NoMount module found on branch '$branch'. Falling back to known-good pinned commit."
-              commit="$FALLBACK_PIN"
-              src="fallback-known-good-pin"
+              echo "::error::No CI-verified NoMount commit found on branch '$branch' and no explicit commit was provided"
+              exit 1
             fi
           fi
 
@@ -691,18 +692,13 @@ jobs:
             echo "## 🚫 NoMount Resolution"
             echo ""
             echo "**Commit:** \`$commit\` ($src) — locked for **all** matrix builds in this run."
-            if [ "$src" = "fallback-known-good-pin" ]; then
-              echo ""
-              echo "**Userspace module:** pinned static ZIP (matches \`1dacddf\`)."
-            else
-              echo ""
-              echo "**Userspace module:** built from source in this run (zig cc) — exact match for \`$commit\`."
-            fi
+            echo ""
+            echo "**Userspace module:** built from source in this run (zig cc) — exact match for \`$commit\`."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::endgroup::"
           
   build-nomount-module:
-    name: Build NoMount module from source (non-pinned commits)
+    name: Build NoMount module from source
     needs: resolve-nomount
     runs-on: ubuntu-latest
     outputs:
@@ -1195,20 +1191,20 @@ jobs:
 
       - name: 🏷️ Generate and Create New Tag
         run: |
-          # Only search for tags starting with this SUSFS version
-          LATEST_MATCHING_TAG=$(gh api repos/$REPO_OWNER/$REPO_NAME/tags \
-            --jq "[.[] | select(.name | startswith(\"${SUSFS_BASE_VERSION}-r\"))] \
-                  | sort_by(.name | split(\"-r\")[1] | tonumber) \
-                  | last | .name // empty")
-          
-          if [ -z "$LATEST_MATCHING_TAG" ]; then
-            # No existing release for this version SUSFS → first release
-            NEW_TAG="${SUSFS_BASE_VERSION}-r1"
+          PREV_R=$(git ls-remote --tags origin "${SUSFS_BASE_VERSION}-r*" \
+            | awk '{print $2}' \
+            | sed "s|.*${SUSFS_BASE_VERSION}-r||" \
+            | grep -E '^[0-9]+$' \
+            | sort -n | tail -n 1 || true)
+          if [ -z "$PREV_R" ]; then
+            NEXT_R=1
+          elif [ "${{ inputs.bump_release_increment }}" = "true" ]; then
+            NEXT_R=$((PREV_R + 1))
           else
-            # Only increment the -r* suffix of the latest release for this version
-            NEW_TAG=$(echo "$LATEST_MATCHING_TAG" | awk -F'-r' '{printf "%s-r%d", $1, $2+1}')
+            NEXT_R="$PREV_R"
           fi
-          
+          TAG_TS=$(date -u +%Y-%m-%d-%H-%M-%S)
+          NEW_TAG="${SUSFS_BASE_VERSION}-r${NEXT_R}-${TAG_TS}"
           echo "New tag: $NEW_TAG"
           echo "NEW_TAG=${NEW_TAG}" >> $GITHUB_ENV
           git tag $NEW_TAG
@@ -1219,7 +1215,7 @@ jobs:
         with:
           path: ./downloaded-artifacts
           merge-multiple: true
-          pattern: "{AK3_*,NoMount-*,nomount-*,matrix.json}"
+          pattern: "{AK3_*,NoMount-*,nomount-*,matrix.json,patch-status-*}"
           skip-decompress: true
           digest-mismatch: warn
 
@@ -1421,8 +1417,27 @@ jobs:
             ' <<< "$JSON_BUILD_DATA")
             
             features=()
-             # If no match found, skip or handle error
-            if [[ -z "$feature_flags" ]]; then
+            status_file="./downloaded-artifacts/patch-status-${model}_${os_ver}.txt"
+            if [[ -f "$status_file" ]]; then
+              while IFS='|' read -r patch_key patch_status; do
+                [[ "$patch_status" == "applied" ]] || continue
+                case "$patch_key" in
+                  hmbird) features+=("🐦 HMBIRD") ;;
+                  susfs) features+=("ඞ SusFS") ;;
+                  bbr) features+=("🚀 BBR") ;;
+                  bbg) features+=("🛡️ BBG") ;;
+                  ttl) features+=("🌐 TTL") ;;
+                  ip_set) features+=("🧱 IP_SET & IPv6 NAT") ;;
+                  unicode) features+=("🔧 Unicode Fix") ;;
+                  ds) features+=("💻 Droidspaces") ;;
+                  ntsync) features+=("🔃 NTSync") ;;
+                  bbrv3) features+=("🚀 BBRv3") ;;
+                  bore) features+=("🌀 BoRE") ;;
+                  lz4) features+=("⚡ LZ4 1.10.0 + ARMv8 NEON") ;;
+                  adios) features+=("🧭 ADIOS") ;;
+                esac
+              done < "$status_file"
+            elif [[ -z "$feature_flags" ]]; then
               echo "Warning: No JSON entry found for model: $model" >&2
               features_str="N/A"
             else
@@ -1440,7 +1455,7 @@ jobs:
               [[ "$ntsync" == "true" ]] && features+=("🔃 NTSync")
               [[ "$bbr3" == "true" ]] && features+=("🚀 BBRv3")
               [[ "$bore" == "true" ]] && features+=("🌀 BoRE")
-              [[ "$lz4_upgrade" == "true" ]] && features+=("⚡ LZ4 1.10")
+              [[ "$lz4_upgrade" == "true" ]] && features+=("⚡ LZ4 1.10.0 + ARMv8 NEON")
               [[ "$adios" == "true" ]] && features+=("🧭 ADIOS")
               
               total=${#features[@]}
@@ -1665,7 +1680,7 @@ jobs:
           
           ### This Release
           - $root_release_label, SUSFS $SUSFS_BASE_VERSION, and NoMount dev integration.
-          - Per-device BoRE scheduler flag (configs/), BBRv3 and ADIOS with probe-first soft-skip.
+          - Per-device patch status reported from actual application results; BoRE, BBRv3 and ADIOS probe-first soft-skip.
           - IPSet, IPv6 NAT, TTL / hop-limit targets, and BBR networking support.
           - TMPFS XATTR / POSIX ACL, Droidspaces, NTSync, and USB OTG support.
           - Ptrace compatibility for older kernel families and Unicode path handling fixes.
@@ -1760,106 +1775,3 @@ jobs:
             fi
           done
 
-      - name: 📱 Send Detailed Telegram Notification
-        if: success()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TG_CHANNEL_URL: ${{ vars.TG_CHANNEL_URL }}
-        run: |
-          set -euo pipefail
-          echo "::group::Telegram Notification"
-          
-          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "⚠️ Telegram secrets not configured. Skipping notification."
-            exit 0
-          fi
-          
-          echo "Aggregating artifact statistics..."
-          
-          # Safely read kernel ZIP files into an array.
-          shopt -s nullglob
-          ZIPS=(./downloaded-artifacts/AK3_*.zip)
-          shopt -u nullglob
-          
-          ZIP_COUNT=${#ZIPS[@]}
-          
-          if [ "$ZIP_COUNT" -eq 0 ]; then
-            MODELS="None"
-            OS_VERS="None"
-            KSU_VERS="Unknown"
-          else
-            # Extract models (2nd part), OS versions (3rd part), and KSU versions (6th part) from AK3_OP12_OOS15_android15-6.6_ReSukiSU_30700...zip
-            MODELS=$(printf "%s\n" "${ZIPS[@]}" | awk -F'/' '{print $NF}' | awk -F'_' '{print $2}' | sort -u | paste -sd ", " -)
-            OS_VERS=$(printf "%s\n" "${ZIPS[@]}" | awk -F'/' '{print $NF}' | awk -F'_' '{print $3}' | sort -u | paste -sd ", " -)
-            KSU_VERS=$(printf "%s\n" "${ZIPS[@]}" | awk -F'/' '{print $NF}' | awk -F'_' '{print $6}' | sort -u | paste -sd ", " -)
-          fi
-          
-          echo "Found $ZIP_COUNT packages for models: $MODELS, KSU Ver: $KSU_VERS"
-
-          CHANNEL_LINE=""
-          if [ -n "$TG_CHANNEL_URL" ]; then
-            CHANNEL_LINE="
-          📢 <a href=\"${TG_CHANNEL_URL}\"><b>FOLLOW REALS3S KERNEL LAB</b></a>"
-          fi
-          
-          # Use pure Bash multi-line string. True newlines are preserved!
-          MSG_TEXT="╭──────────────────────╮
-          🌌 <b>REALS3S // KERNEL LAB</b>
-          <i>OnePlus • ${ROOT_DISPLAY} • SUSFS • NoMount</i>
-          ╰──────────────────────╯
-          ┈
-          <b>NEW RELEASE IS READY</b> ✨
-          🏷️ <code>${{ env.NEW_TAG }}</code>
-          ┈
-          <b>CORE STACK</b>
-          🔐 ${ROOT_DISPLAY} <code>v${KSU_VERS}</code>
-          🛡️ SUSFS <code>${{ env.SUSFS_BASE_VERSION }}</code>
-          🚫 NoMount <b>integrated</b>
-          ⚙️ Clang ${{ inputs.optimize_level }} • Clean build: ${{ inputs.clean_build }}
-          ┈
-          <b>COMPATIBILITY</b>
-          📦 ${ZIP_COUNT} flashable packages
-          💻 ${OS_VERS}
-          📱 ${MODELS}
-          ──────────────────────
-          🌐 <a href=\"https://sss1981-op.github.io/OnePlus_ReSukiSU_SUSFS/\"><b>DOWNLOAD FROM DEVICE CATALOG (RECOMMENDED)</b></a>
-          ⬇️ <a href=\"${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.NEW_TAG }}\"><b>DOWNLOAD RELEASE</b></a>${CHANNEL_LINE}"
-          
-          # Split TG_CHAT_ID by comma or space
-          IFS=' ,' read -r -a CHAT_IDS <<< "$TG_CHAT_ID"
-          
-          for ID in "${CHAT_IDS[@]}"; do
-            if [ -z "$ID" ]; then continue; fi
-            echo "Constructing secure JSON payload for Chat ID: $ID..."
-            
-            # jq automatically escapes the true newlines and HTML characters into a safe JSON string
-            PAYLOAD=$(jq -n \
-              --arg chat_id "$ID" \
-              --arg text "$MSG_TEXT" \
-              '{
-                chat_id: $chat_id,
-                parse_mode: "HTML",
-                disable_web_page_preview: true,
-                text: $text
-              }')
-            
-            echo "Sending POST request to Telegram API (Chat ID: $ID)..."
-            
-            # Send payload as application/json
-            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD")
-            
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
-
-            if [ "$HTTP_CODE" -eq 200 ]; then
-              echo "✅ Detailed Telegram notification sent successfully to $ID! response: $RESPONSE_BODY"
-            else
-              echo "❌ Failed to send Telegram notification to $ID! status code: $HTTP_CODE, response: $RESPONSE_BODY"
-              # We don't necessarily want to exit if one ID fails, but we should log it.
-              # However, if it's the only ID, maybe we should? Let's keep it robust.
-            fi
-          done
-          echo "::endgroup::"

@@ -23,6 +23,11 @@ inputs:
     required: false
     type: string
     default: ""
+  nomount_commit:
+    description: 'NoMount commit SHA to pin (empty = built-in known-good fallback pin)'
+    required: false
+    type: string
+    default: ""
   build_timestamp:
     description: 'Custom kernel build timestamp shown in uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty to use the current build time.'
     required: false
@@ -40,6 +45,11 @@ inputs:
     default: false
   debug:
     description: 'Enable dumping debug related artifacts'
+    required: false
+    type: boolean
+    default: false
+  patch_dry_run:
+    description: 'Apply all patches and stop before compilation (verification mode)'
     required: false
     type: boolean
     default: false
@@ -115,6 +125,14 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        P_MODEL="$(jq -r '.model // "unknown"' /tmp/config.json)"
+        P_OSVER="$(jq -r '.os_version // "unknown"' /tmp/config.json)"
+        PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
+        echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
+        echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
+        if [ -z "${OP_BORE:-}" ]; then
+          echo "OP_BORE=true" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -289,6 +307,12 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
+        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3 OP_BORE; do
+          val="${!bool_opt:-}"
+          if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
+            errors+=("$bool_opt must be true or false if set. Got: '$val'")
+          fi
+        done
         if [ ${#errors[@]} -ne 0 ]; then
           echo "Found ${#errors[@]} validation error(s):" >&2
           for error in "${errors[@]}"; do
@@ -359,6 +383,7 @@ runs:
         echo "MSM_KERNEL_FOLDER=$MSM_KERNEL_DIR" >> "$GITHUB_ENV"
         echo "AK3_FOLDER=$AK3_DIR" >> "$GITHUB_ENV"
         echo "DEBUG_ARTIFACTS_FOLDER=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
+        echo "DEBUG_ARTIFACTS_DIR=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
         echo "KERNEL_PATCHES_FOLDER=$KERNEL_PATCHES_DIR" >> "$GITHUB_ENV"
         echo "SUSFS_FOLDER=$SUSFS_DIR" >> "$GITHUB_ENV"
         echo "NOMOUNT_FOLDER=$NOMOUNT_DIR" >> "$GITHUB_ENV"
@@ -805,7 +830,12 @@ runs:
           while [ $attempt -le $max_attempts ]; do
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
               
-              if aria2c -x16 -s16 -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+              local aria_splits="-x16 -s16 -j16"
+          if [[ "$url" == *"gitlab.com"* ]]; then
+            # GitLab throttles per-IP bursts; 16-way segmentation invites 429s
+            aria_splits="-x4 -s4"
+          fi
+          if aria2c $aria_splits -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
                   mkdir -p "$repo_name"
                   if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
                       echo "✅ Success: $repo_name synced"
@@ -816,11 +846,11 @@ runs:
               
               echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
               rm -rf "$repo_name" "$shm_path" 2>/dev/null
-              sleep 5
+              [ $attempt -lt $max_attempts ] && sleep $((attempt * 15))
               attempt=$((attempt + 1))
           done
           
-          echo "::error::All attempts failed for $url"
+          echo "::warning::Archive fetch failed for $url after $max_attempts attempts - caller will fall back to git clone"
           return 1
         }
         
@@ -881,16 +911,34 @@ runs:
         
         retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
         git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
-        git -C nomount fetch --depth 1 origin 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
-        git -C nomount checkout --detach 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
+        NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
+        if [ -z "$NOMOUNT_TARGET" ]; then
+          echo "::error::No NoMount commit resolved upstream and none was provided"
+          exit 1
+        fi
+        echo "Using NoMount commit: $NOMOUNT_TARGET"
+        git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+        git -C nomount checkout --detach "$NOMOUNT_TARGET"
         NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+        if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
+          echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+          exit 1
+        fi
+        git -C nomount log --oneline -1
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "Using pinned NoMount dev commit: $NOMOUNT_COMMIT_SHA"
+        echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
-            echo "::error::Failed to fetch SUSFS archive after multiple attempts"
-            exit 1
+            echo "::warning::SUSFS archive fetch throttled; falling back to a plain git clone"
+            rm -rf "$SUSFS_FOLDER"
+            if git clone --no-checkout "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_FOLDER" \
+               && git -C "$SUSFS_FOLDER" checkout --detach "$SUSFS_BRANCH"; then
+              echo "SUSFS tree fetched via git clone fallback at $SUSFS_BRANCH"
+            else
+              echo "::error::Failed to fetch SUSFS after both archive and git-clone attempts"
+              exit 1
+            fi
           fi
           echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> $GITHUB_ENV
         fi
@@ -975,12 +1023,10 @@ runs:
         cd "$KERNEL_PLATFORM_FOLDER"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
         if [ -z "$KSU_INPUT" ]; then
-          KSU_INPUT="3b18216f71df189ab3d1b1ce0bdb21be1268e771"
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -
+        else
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
         fi
-
-        curl --fail --location --proto '=https' -LSs \
-          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/3b18216f71df189ab3d1b1ce0bdb21be1268e771/kernel/setup.sh" \
-          | bash -s "$KSU_INPUT"
         git -C KernelSU-Next submodule update --init --recursive
         cd KernelSU-Next/kernel
 
@@ -1016,7 +1062,7 @@ runs:
         echo "✅ KernelSU Next added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
-    - name: Add ReSukiSU (The Sukisaku Project)
+    - name: Add ReSukiSU
       shell: bash
       if: ${{ inputs.ksu_type == 'ReSukiSU' }}
       run: |
@@ -1047,6 +1093,27 @@ runs:
         
         echo "ReSukiSU Version: $KSU_VERSION"
         echo "✅ ReSukiSU added (commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "::endgroup::"
+
+    - name: Add ReSukiSU Root Tag
+      if: ${{ inputs.ksu_type == 'ReSukiSU' && env.OP_ROOT_TAG != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Add ReSukiSU root tag"
+        if ! grep -rq 'config KSU_FULL_NAME_FORMAT' "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Kconfig"; then
+          echo "::warning::ReSukiSU Kconfig has no KSU_FULL_NAME_FORMAT symbol, skipping root tag"
+          echo "::endgroup::"
+          exit 0
+        fi
+        MANAGER_BRANCH="${{ inputs.ksu_branch_or_hash }}"
+        [ -z "$MANAGER_BRANCH" ] && MANAGER_BRANCH="main"
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KSU_FULL_NAME_FORMAT="${OP_ROOT_TAG}@%REPO_NAME%"
+        EOF
+        grep -n 'CONFIG_KSU_FULL_NAME_FORMAT' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        echo "ROOT_TAG_APPLIED=${OP_ROOT_TAG}" >> "$GITHUB_ENV"
+        echo "Root tag applied: ${OP_ROOT_TAG}"
         echo "::endgroup::"
 
     - name: Apply SUSFS Patches
@@ -1080,7 +1147,7 @@ runs:
           "v1.5.8")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not apply cleanly (soft-fail, continuing)"
             else
               echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
             fi
@@ -1093,7 +1160,7 @@ runs:
               echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
             fi
             ;;
-          "v2.2.0")
+          "v2.2.0"|"v2.3.0")
             if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1509,6 +1576,7 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+        echo "susfs|applied" >> "$PS_FILE"
         
         echo "::endgroup::"
     
@@ -1520,74 +1588,119 @@ runs:
 
         cd "$COMMON_KERNEL_FOLDER"
 
-        echo "Copying NoMount source..."
-        cp -av "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/"
+        echo "Installing NoMount Kbuild package at fs/nomount/..."
+        rm -rf "$COMMON_KERNEL_FOLDER/fs/nomount"
+        mkdir -p "$COMMON_KERNEL_FOLDER/fs/nomount"
+        cp -a "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.c" ]; then
-          echo "::error::nomount.c was not copied successfully"
-          exit 1
-        fi
-
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.h" ]; then
-          echo "::error::nomount.h was not copied successfully"
-          exit 1
-        fi
-
-        echo "✅ NoMount source copied"
-
-        echo "Listing NoMount kernel directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel"
-
-        echo ""
-        echo "Listing NoMount patches directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel/patches"
-
-        echo ""
-        echo "Available NoMount patches:"
-        find "$NOMOUNT_FOLDER/kernel/patches" -maxdepth 1 -type f -name "*.patch" | sort
-
-        case "$KERNEL_VER" in
-          5.10|5.15|6.1|6.6|6.12)
-            NOMOUNT_PATCH="$NOMOUNT_FOLDER/kernel/patches/nomount_${KERNEL_VER}_kernel_integration.patch"
-            ;;
-          *)
-            echo "::error::Unsupported NoMount kernel version: $KERNEL_VER"
+        for f in nomount.c nomount.h Kconfig Makefile; do
+          if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount/$f" ]; then
+            echo "::error::fs/nomount/$f missing after copy"
             exit 1
-            ;;
-        esac
+          fi
+        done
+        echo "✅ NoMount source installed"
 
-        echo ""
-        echo "Using NoMount patch:"
-        echo "$NOMOUNT_PATCH"
-
-        if [ ! -f "$NOMOUNT_PATCH" ]; then
-          echo "::error::NoMount patch not found: $NOMOUNT_PATCH"
-          exit 1
+        if ! grep -q "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"; then
+          printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$COMMON_KERNEL_FOLDER/fs/Makefile"
+          echo "➕ fs/Makefile wired"
         fi
 
-        echo "Applying NoMount patch..."
-
-        if ! patch -p1 --forward < "$NOMOUNT_PATCH"; then
-          echo "::error::NoMount patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
+        if ! grep -q 'source "fs/nomount/Kconfig"' "$COMMON_KERNEL_FOLDER/fs/Kconfig"; then
+          awk '
+            /^endmenu/ { last_match = NR }
+            { lines[NR] = $0 }
+            END {
+              for (i = 1; i <= NR; i++) {
+                if (i == last_match) print "source \"fs/nomount/Kconfig\""
+                print lines[i]
+              }
+            }
+          ' "$COMMON_KERNEL_FOLDER/fs/Kconfig" > "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" \
+            && mv "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+          echo "➕ fs/Kconfig wired"
         fi
-
-        echo "✅ NoMount patch applied"
 
         echo "Adding NoMount configuration..."
-
         if ! grep -q "^CONFIG_NOMOUNT=y" "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"; then
           printf '%s\n' 'CONFIG_NOMOUNT=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         fi
-        echo "NOMOUNT_PATCH_NAME=$(basename "$NOMOUNT_PATCH")" >> "$GITHUB_ENV"
-        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "$(basename "$NOMOUNT_PATCH")" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "NOMOUNT_PATCH_NAME=kernel-integration-Kbuild" >> "$GITHUB_ENV"
+        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "kernel-integration (setup.sh method)" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
 
-        echo "Verifying NoMount files..."
-        ls -l "$COMMON_KERNEL_FOLDER/fs"/nomount*
+        echo "Verifying NoMount wiring..."
+        grep -n "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"
+        grep -n 'fs/nomount/Kconfig' "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+        ls -la "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
         echo "✅ NoMount integration completed"
+        echo "nomount|applied" >> "$PS_FILE"
+        echo "::endgroup::"
 
+    - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)
+      if: ${{ env.OP_LZ4_UPGRADE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Upgrade LZ4"
+        cd "$COMMON_KERNEL_FOLDER"
+        if [ -f lib/lz4/lz4.c ] && grep -q 'lib/lz4/lz4.h' include/linux/lz4.h 2>/dev/null; then
+          echo "LZ4 already upgraded, skipping"
+        else
+          rm -rf "$GITHUB_WORKSPACE/lz4_oplus"
+          git clone --depth 1 https://github.com/Numbersf/lz4_oplus.git "$GITHUB_WORKSPACE/lz4_oplus"
+          bash "$GITHUB_WORKSPACE/lz4_oplus/apply_lz4_oplus.sh"
+        fi
+        grep -q 'lib/lz4/lz4.h' include/linux/lz4.h
+        grep -q 'LZ4_arm64_decompress_safe' crypto/lz4.c
+        ls lib/lz4/lz4.c lib/lz4/lz4hc.c lib/lz4/lz4armv8/lz4accel.c > /dev/null
+        echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
+        echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
+        echo "LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+        echo "lz4|applied" >> "$PS_FILE"
+        echo "::endgroup::"
+
+    - name: Enable ADIOS I/O Scheduler
+      if: ${{ env.OP_ADIOS == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Enable ADIOS I/O scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        if [ ! -f block/adios.c ]; then
+          ADIOS_FILE="adios_ioscheduler_${KERNEL_VER}.patch"
+          case "${OP_BRANCH:-}" in
+            *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
+          esac
+          curl -sSL --fail -o /tmp/adios.patch             "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
+          if ! patch -p1 --dry-run --forward < /tmp/adios.patch; then
+            echo "::warning::ADIOS patch does not apply for ${KERNEL_VER} (${ADIOS_FILE}) — soft-skipping ADIOS, build continues without it"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            {
+              echo "=== ADIOS probe FAILED for kernel ${KERNEL_VER} (${ADIOS_FILE}) ==="
+              echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
+              patch -p1 --dry-run --forward < /tmp/adios.patch 2>&1 || true
+            } > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1
+            echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
+            echo "adios|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+          patch -p1 --forward < /tmp/adios.patch
+        else
+          echo "block/adios.c already present, enabling config only"
+        fi
+        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
+        grep -q 'adios.o' block/Makefile
+        grep -q '^CONFIG_MQ_IOSCHED_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
+        echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
+        echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
+        echo "ADIOS I/O scheduler enabled"
+        echo "adios|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -1613,6 +1726,7 @@ runs:
           fi
         fi
         echo "✅ BBG LSM added"
+        echo "bbg|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply KSU Hooks
@@ -1629,6 +1743,7 @@ runs:
           exit 1
         fi
         echo "✅ KSU hooks applied"
+        echo "ksu_hooks|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply Other Patches
@@ -1702,6 +1817,7 @@ runs:
             find . -name "*.rej" -delete 2>/dev/null || true
           fi
         else
+          echo "hmbird|applied" >> "$PS_FILE"
           echo "Hmbird not enabled, skipping fengchi patch"
         fi
 
@@ -1885,17 +2001,21 @@ runs:
         
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
           echo "Patching clear_page_16bytes_align.patch"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
-            echo "::warning::clear_page_16bytes_align patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
+          if patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
+            patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
+          else
+            echo "::warning::clear_page_16bytes_align patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_dryrun.log" 2>&1 || true
           fi
         else
           echo "Patching clear_page_16bytes_align.patch (sed variant)"
-          if ! cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward; then
-            echo "::warning::clear_page_16bytes_align (sed variant) patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
+          if cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward; then
+            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward
+          else
+            echo "::warning::clear_page_16bytes_align (sed variant) patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
+            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_sed_dryrun.log" 2>&1 || true
           fi
         fi
         
@@ -1967,10 +2087,12 @@ runs:
           exit 1
         fi
         echo "Patching use_unlikely_wrap_cpufreq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
-          echo "::warning::use_unlikely_wrap_cpufreq patch did not apply cleanly. Continuing without it (cpufreq optimization only)."
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          find . -name "*.rej" -delete 2>/dev/null || true
+        if patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
+          patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
+        else
+          echo "::warning::use_unlikely_wrap_cpufreq patch does not apply for this tree - skipping WITHOUT touching the tree (cpufreq optimization only)"
+          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+          patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch" > "$GITHUB_WORKSPACE/patch-faillogs/use_unlikely_wrap_cpufreq_dryrun.log" 2>&1 || true
         fi
         
         echo "✅ Other patches applied"
@@ -2052,6 +2174,7 @@ runs:
         CONFIG_NTSYNC=y
         EOF
         echo "✅ NTSync patch applied"
+        echo "ntsync|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Apply Unicode Fix Patch
@@ -2078,6 +2201,7 @@ runs:
               exit 1
             fi
         fi
+        echo "unicode|applied" >> "$PS_FILE"
 
     - name: Add Tmpfs Support
       shell: bash
@@ -2102,6 +2226,90 @@ runs:
         CONFIG_NET_SCH_FQ=y
         CONFIG_NET_SCH_FQ_CODEL=y
         EOF
+        echo "bbr|applied" >> "$PS_FILE"
+
+    - name: Apply BBRv3
+      if: ${{ env.OP_BBR3 == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BBRv3"
+        cd "$COMMON_KERNEL_FOLDER"
+        BBR3_BASE="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
+        MAIN_PATCH="0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch"
+        DEBUGFS_PATCH="0002-net-tcp-bbr3-add-debugfs-diagnostics-and-runtime-tunables.patch"
+        curl -sSL --fail -o /tmp/bbr3_main.patch "$BBR3_BASE/$MAIN_PATCH"
+        curl -sSL --fail -o /tmp/bbr3_debugfs.patch "$BBR3_BASE/$DEBUGFS_PATCH"
+        if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
+          curl -sSL --fail -o /tmp/bbr3_sysctl_add.patch "$BBR3_BASE/sysctl_add_proc_dou8vec_minmax.patch"
+          curl -sSL --fail -o /tmp/bbr3_sysctl_fix.patch "$BBR3_BASE/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch"
+          if ! patch -p1 --forward < /tmp/bbr3_sysctl_add.patch; then
+            echo "::error::BBRv3 sysctl helper (proc_dou8vec_minmax) failed for ${ANDROID_VER}-${KERNEL_VER}"
+            exit 1
+          fi
+          if ! patch -p1 --forward < /tmp/bbr3_sysctl_fix.patch; then
+            echo "::error::BBRv3 sysctl data-races fix failed for ${ANDROID_VER}-${KERNEL_VER}"
+            exit 1
+          fi
+        fi
+        if ! patch -p1 --forward < /tmp/bbr3_main.patch; then
+          echo "::error::BBRv3 backport failed for ${ANDROID_VER}-${KERNEL_VER}"
+          exit 1
+        fi
+        if patch -p1 --dry-run --forward < /tmp/bbr3_debugfs.patch; then
+          patch -p1 --forward < /tmp/bbr3_debugfs.patch
+          echo "BBRv3 debugfs diagnostics (0002) applied"
+        else
+          echo "::warning::0002 debugfs patch targets the 6.12 tcp_bbr3.c post-image; not compatible with ${ANDROID_VER}-${KERNEL_VER}. BBRv3 core is unaffected - skipping diagnostics only."
+        fi
+        grep -q 'config TCP_CONG_BBR3' net/ipv4/Kconfig
+        grep -q 'tcp_bbr3' net/ipv4/Makefile
+        grep -q '^CONFIG_TCP_CONG_BBR=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_NET_SCH_FQ=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_NET_SCH_FQ=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_TCP_CONG_BBR3=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR3=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
+        echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
+        echo "bbrv3|applied" >> "$PS_FILE"
+        echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
+        echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
+
+    - name: Apply BoRE
+      if: ${{ env.OP_BORE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BoRE scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        BORE_PATCH="bore_${KERNEL_VER}.patch"
+        curl -sSL --fail -o /tmp/bore.patch \
+          "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}"
+        if ! patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch; then
+          echo "::warning::BoRE patch does not apply for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) — soft-skipping BoRE, build continues without it"
+          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+          {
+            echo "=== BoRE probe FAILED for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) ==="
+            echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
+            patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch 2>&1 || true
+          } > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1
+          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "bore|skipped" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+        patch -p1 --forward --fuzz=0 < /tmp/bore.patch
+        grep -q 'config SCHED_BORE' init/Kconfig
+        grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
+        echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
+        echo "bore|applied" >> "$PS_FILE"
+        echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+        echo "BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
 
     - name: Add TTL Target Support
       if: ${{ env.OP_TTL == 'true' }}
@@ -2114,6 +2322,7 @@ runs:
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
+        echo "ttl|applied" >> "$PS_FILE"
 
     - name: Add IP SET & IPv6_NAT Support
       if: ${{ env.OP_IP_SET == 'true' }}
@@ -2161,6 +2370,7 @@ runs:
           find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
           exit 1
         fi
+        echo "ip_set|applied" >> "$PS_FILE"
     
     - name: Add USB DWC3 & OTG Support
       shell: bash
@@ -2198,7 +2408,7 @@ runs:
 
     - name: Add LXC / Droidspaces support
       shell: bash
-      if: ${{ env.OP_LXC_DS == 'true' }}
+      if: ${{ env.OP_LXC_DS == 'true' && env.OP_DS != 'true' }}
       run: |
         set -euo pipefail
         echo "Add Droidspaces Support"
@@ -2217,6 +2427,7 @@ runs:
         CONFIG_PID_NS = y
         CONFIG_POSIX_MQUEUE = y
         EOF
+        echo "ds|applied" >> "$PS_FILE"
 
     - name: Add Droidspaces support
       shell: bash
@@ -2302,6 +2513,7 @@ runs:
         fi
         
         echo "✅ Droidspaces Support applied"
+        echo "ds|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add Build based configs
@@ -2386,7 +2598,7 @@ runs:
         echo "Customize Kernel Branding"
         cd "$COMMON_KERNEL_FOLDER"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}-${{ github.actor }}"
+        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
 
     - name: Disable GPUEB
@@ -2407,7 +2619,7 @@ runs:
         
         OPTIONS=()
         
-        if [ "$OP_BBR" = "true" ] || [ "$OP_BBR3" = "true" ]; then
+        if [ "${OP_BBR:-}" = "true" ] || [ "${OP_BBR3:-}" = "true" ]; then
           OPTIONS+=("CONFIG_TCP_CONG_ADVANCED")
         fi
         
@@ -2418,8 +2630,63 @@ runs:
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
 
+    - name: Patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Patch dry-run verdict"
+        VERDICT="$DEBUG_ARTIFACTS_DIR/patch_dry_run_${OP_MODEL}_${OP_OS_VERSION}.txt"
+        {
+          echo "device=$OP_MODEL os=$OP_OS_VERSION"
+          echo "kernel=${ANDROID_VER}-${TKERNEL_VER}"
+          echo "adios=${ADIOS_ENABLED:-not-applied}"
+          echo "bbrv3=${BBR3_APPLIED:-not-applied}"
+          echo "bore=${BORE_APPLIED:-not-applied}"
+          echo "bore_skipped=${BORE_SKIPPED:-none}"
+          echo "adios_skipped=${ADIOS_SKIPPED:-none}"
+          if [ -n "${BORE_SKIPPED:-}" ] || [ -n "${ADIOS_SKIPPED:-}" ]; then
+            echo "result=PARTIAL_PATCHES_APPLIED"
+          else
+            echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+          fi
+        } > "$VERDICT"
+        cat "$VERDICT"
+        if [ -n "${BORE_SKIPPED:-}" ] || [ -n "${ADIOS_SKIPPED:-}" ]; then
+          echo "::notice::patch_dry_run=true — patches applied with soft-skips for ${OP_MODEL} ${OP_OS_VERSION} (see verdict). Compilation intentionally skipped."
+        else
+          echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+        fi
+        echo "::endgroup::"
+
+    - name: Upload patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-dry-run-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}
+        path: ${{ env.DEBUG_ARTIFACTS_DIR }}/patch_dry_run_*.txt
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Upload patch status
+      if: ${{ always() && env.PS_FILE != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-status-${{ env.PS_BASE }}
+        path: ${{ env.PS_FILE }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Stop before build (dry run)
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        echo "Dry run complete — see the patch-dry-run artifact. Not building."
+        exit 0
+        
     - name: Build Kernel
       id: build_kernel_step
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       env:
         PYTHONWARNINGS: "ignore:invalid escape sequence"
@@ -2464,7 +2731,10 @@ runs:
         export SOURCE_DATE_EPOCH=$COMMIT_TIMESTAMP
         if [ -n "${{ inputs.build_timestamp }}" ]; then
           export KBUILD_BUILD_TIMESTAMP="${{ inputs.build_timestamp }}"
-          echo "📅 Using custom build timestamp: $KBUILD_BUILD_TIMESTAMP"
+          echo "📅 Using custom build timestamp input: $KBUILD_BUILD_TIMESTAMP"
+        elif [ -n "${OP_BUILD_TIME:-}" ] && [ "${OP_BUILD_TIME}" != "null" ]; then
+          export KBUILD_BUILD_TIMESTAMP="$OP_BUILD_TIME"
+          echo "📅 Using per-config build_time: $KBUILD_BUILD_TIMESTAMP"
         else
           export KBUILD_BUILD_TIMESTAMP="$KERNEL_BUILD_DATE"
           echo "📅 Using current UTC build timestamp: $KBUILD_BUILD_TIMESTAMP"
@@ -2632,7 +2902,7 @@ runs:
 
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
-      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') }}
+      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2702,6 +2972,7 @@ runs:
 
     - name: Collect Build Stats / Validate Image
       id: collect_stats
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2759,6 +3030,7 @@ runs:
 
     - name: Create Kernel ZIP
       id: create_zip
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2821,10 +3093,13 @@ runs:
         echo "::endgroup::"
 
     - name: Final Build Summary
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
         
+        pstat() { local v; v="$(awk -F'|' -v k="$1" '$1==k{print $2}' "$PS_FILE" 2>/dev/null || true)"; echo "${v:-not requested}"; }
+
         # Get commit SHAs with fallback
         KSU_SHA="${KSU_COMMIT_SHA:-unknown}"
         SUSFS_SHA="${SUSFS_COMMIT_SHA:-unknown}"
@@ -2852,15 +3127,21 @@ runs:
           echo "Optimization: ${{ inputs.optimize_level }}"
           echo "Clean Build: ${{ inputs.clean }}"
           echo ""
-          echo "=== OnePlus Features ==="
-          echo "BBR: ${{ env.OP_BBR }}"
-          echo "BBG: ${{ env.OP_BBG }}"
-          echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
-          echo "TTL: ${{ env.OP_TTL }}"
-          echo "IP_SET & IPv6 NAT: ${{ env.OP_IP_SET }}"
-          echo "Unicode Fix: ${{ env.OP_UNICODE }}"
-          echo "NTSync: ${{ env.OP_NTSYNC }}"
-          echo "Droidspaces: ${{ env.OP_DS }}"
+          echo "=== Patch Status (actual application results) ==="
+          echo "SusFS: $(pstat susfs)"
+          echo "BBR: $(pstat bbr)"
+          echo "BBRv3: $(pstat bbrv3)"
+          echo "BoRE: $(pstat bore)"
+          echo "ADIOS: $(pstat adios)"
+          echo "BBG: $(pstat bbg)"
+          echo "HMBIRD SCX: $(pstat hmbird)"
+          echo "TTL: $(pstat ttl)"
+          echo "IP_SET & IPv6 NAT: $(pstat ip_set)"
+          echo "Unicode Fix: $(pstat unicode)"
+          echo "NTSync: $(pstat ntsync)"
+          echo "Droidspaces: $(pstat ds)"
+          echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
+          echo "NoMount: $(pstat nomount)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
@@ -2915,18 +3196,24 @@ runs:
           fi
           
           echo ""
-          echo "### 🔧 OnePlus Features"
+          echo "### 🔧 Patch Status (actual application results)"
           echo ""
           echo "| Feature | Status |"
           echo "|---------|--------|"
-          echo "| **BBR** | ${{ env.OP_BBR }} |"
-          echo "| **BBG** | ${{ env.OP_BBG }} |"
-          echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
-          echo "| **TTL** | ${{ env.OP_TTL }} |"
-          echo "| **IP_SET & IPv6 NAT** | ${{ env.OP_IP_SET }} |"
-          echo "| **Unicode Fix** | ${{ env.OP_UNICODE }} |"
-          echo "| **NTSync** | ${{ env.OP_NTSYNC }} |"
-          echo "| **Droidspaces** | ${{ env.OP_DS }} |"
+          echo "| **SusFS** | $(pstat susfs) |"
+          echo "| **BBR** | $(pstat bbr) |"
+          echo "| **BBRv3** | $(pstat bbrv3) |"
+          echo "| **BoRE** | $(pstat bore) |"
+          echo "| **ADIOS** | $(pstat adios) |"
+          echo "| **BBG** | $(pstat bbg) |"
+          echo "| **HMBIRD SCX** | $(pstat hmbird) |"
+          echo "| **TTL** | $(pstat ttl) |"
+          echo "| **IP_SET & IPv6 NAT** | $(pstat ip_set) |"
+          echo "| **Unicode Fix** | $(pstat unicode) |"
+          echo "| **NTSync** | $(pstat ntsync) |"
+          echo "| **Droidspaces** | $(pstat ds) |"
+          echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
+          echo "| **NoMount** | $(pstat nomount) |"
           
           echo ""
           echo "### 📊 Build Metrics"
@@ -2959,7 +3246,7 @@ runs:
         retention-days: 90
 
     - name: Upload Artifacts
-      if: success() && steps.create_zip.conclusion == 'success'
+      if: ${{ success() && steps.create_zip.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: ${{ env.ZIP_NAME }}
@@ -2969,7 +3256,7 @@ runs:
         retention-days: 90
 
     - name: Upload ccache log
-      if: success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: "${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}_${{ env.KERNEL_FULL_VER }}_ccache.log"

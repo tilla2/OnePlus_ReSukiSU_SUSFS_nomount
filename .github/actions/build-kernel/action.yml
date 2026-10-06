@@ -401,7 +401,8 @@ runs:
         cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}"
-          local base="$GITHUB_WORKSPACE/patchgen/${name}" um="${base}/unmodified" md="${base}/modified"
+          local base="$GITHUB_WORKSPACE/patchgen/${name}"
+          local um="${base}/unmodified" md="${base}/modified"
           rm -rf "$base" && mkdir -p "$um" "$md"
           local src="/tmp/pg_${name}.patch"
           if [ -n "$sed_expr" ]; then sed -e "$sed_expr" "$patch_file" > "$src"; else cp "$patch_file" "$src"; fi
@@ -428,7 +429,7 @@ runs:
             echo "${name}|failed" >> "${PS_FILE:-patch-status-raw.txt}"
             return 0
           fi
-          diff -ruN "$um" "$md" > "${base}/regen.patch" || true
+          ( cd "$base" && diff -ruN unmodified modified ) > "${base}/regen.patch" || true
           if patch -p1 --forward --fuzz=0 < "${base}/regen.patch" > "${base}/apply.log" 2>&1; then
             echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
           else

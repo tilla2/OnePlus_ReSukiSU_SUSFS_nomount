@@ -549,17 +549,32 @@ runs:
         }
         fuzz_restage() {
           local name="$1" src="$2" md="$3" targets="$4" base="$5"
-          local f
+          local f h hdir hlist ok=1
           for f in $targets; do
             case "$f" in /dev/null) continue ;; esac
             [ -f "$f" ] || continue
             cp "$f" "${md}/$f"
           done
           : > "${base}/fuzz.log"
-          if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/fuzz.log" 2>&1 && ! find "$md" -name '*.rej' 2>/dev/null | grep -q .; then
-            find "$md" -name '*.orig' -delete 2>/dev/null || true
+          hdir="${base}/hunks_fuzz"
+          split_hunks "$src" "$hdir"
+          hlist=$(ls "$hdir"/*.hunk 2>/dev/null || true)
+          for h in $hlist; do
+            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+              continue
+            fi
+            if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+              echo "hunk ${h##*/} staged at fuzz=2 (sandbox only)" >> "${base}/fuzz.log"
+              continue
+            fi
+            echo "hunk ${h##*/} not stageable even at fuzz=2" >> "${base}/fuzz.log"
+            ok=0
+          done
+          find "$md" -name '*.rej' -delete 2>/dev/null || true
+          find "$md" -name '*.orig' -delete 2>/dev/null || true
+          if [ "$ok" -eq 1 ]; then
             cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
-            echo "[patchgen] ${name}: staged with bounded fuzz (sandbox only); regenerating exact patch for the target tree"
+            echo "[patchgen] ${name}: staged with bounded per-hunk fuzz (sandbox only); regenerating exact patch for the target tree"
             return 0
           fi
           cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true

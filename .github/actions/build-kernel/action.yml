@@ -445,7 +445,7 @@ runs:
           fi
           local kdir="$COMMON_KERNEL_FOLDER" adir="/tmp/pg_${name}_anchor" bdir="/tmp/pg_${name}_base" mdir="/tmp/pg_${name}_merged"
           local alog="/tmp/pg_${name}_anchor.log"
-          rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$mdir"
+          rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$bdir" "$mdir"
           echo "[patchgen] ${name}: staging failed — attempting anchor 3-way merge (base ${sha})"
           : > "$alog"
           git -C "$kdir" fetch --depth=1 origin "$sha" >> "$alog" 2>&1 || true
@@ -453,10 +453,11 @@ runs:
             echo "::warning::[patchgen] ${name}: anchor ${sha} not fetchable from origin; rescue aborted"
             return 1
           fi
-          if ! git -C "$kdir" archive "$sha" | tar -x -C "$adir" >> "$alog" 2>&1; then
+          if ! git -C "$kdir" archive "$sha" | tar -x -C "$bdir" >> "$alog" 2>&1; then
             echo "::warning::[patchgen] ${name}: anchor ${sha} archive failed; rescue aborted"
             return 1
           fi
+          cp -a "$bdir/." "$adir/"
           if ! patch -p1 --dry-run --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1; then
             echo "::warning::[patchgen] ${name}: patch does not apply cleanly on anchor ${sha} (stale anchor); rescue aborted"
             cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
@@ -2510,7 +2511,7 @@ runs:
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         gen_patch ntsync "$NTSYNC_FOLDER/ntsync_base.patch" "" "g:drivers/misc/ntsync.c|ntsync_misc"
-        if grep -Eq '^ntsync\|(applied\|already)$' "$PS_FILE"; then
+        if grep -Eq '^ntsync\|(applied|already)$' "$PS_FILE"; then
           printf '%s\n' 'CONFIG_NTSYNC=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
           echo "✅ NTSync patch applied"
         fi
@@ -2715,7 +2716,7 @@ runs:
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         echo "Patching IPv6_NAT_FIX.patch"
         gen_patch ipv6-nat "$KERNEL_PATCHES_FOLDER/common/IPv6_NAT_FIX.patch" "" "g:kernel/Makefile|IP6_NF_NAT"
-        if grep -Eq '^ipv6-nat\|(applied\|already)$' "$PS_FILE"; then
+        if grep -Eq '^ipv6-nat\|(applied|already)$' "$PS_FILE"; then
           echo "ip_set|applied" >> "$PS_FILE"
         else
           echo "ip_set|failed" >> "$PS_FILE"

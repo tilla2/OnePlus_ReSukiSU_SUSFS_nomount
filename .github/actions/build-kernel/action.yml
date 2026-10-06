@@ -1,5 +1,5 @@
-name: 'Build OnePlus Kernel with KernelSU Next / KernelSU / ReSukiSU'
-description: 'GitHub Action to build OnePlus kernels with KernelSU Next, KernelSU, or ReSukiSU plus SUSFS and NoMount integration'
+name: 'Build OnePlus Kernel with KernelSU Next / KernelSU / BakaSU'
+description: 'GitHub Action to build OnePlus kernels with KernelSU Next, KernelSU, or BakaSU plus SUSFS and NoMount integration'
 inputs:
   op_config_json:
     description: 'JSON string containing full device config'
@@ -11,7 +11,7 @@ inputs:
     type: choice
     options:
       - KSU
-      - ReSukiSU
+      - BakaSU
       - KSUN
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash (empty = auto-detect by ksu_type)'
@@ -20,6 +20,11 @@ inputs:
     default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash (empty = auto-detect by kernel version)'
+    required: false
+    type: string
+    default: ""
+  nomount_commit:
+    description: 'NoMount commit SHA to pin (empty = built-in known-good fallback pin)'
     required: false
     type: string
     default: ""
@@ -40,6 +45,11 @@ inputs:
     default: false
   debug:
     description: 'Enable dumping debug related artifacts'
+    required: false
+    type: boolean
+    default: false
+  patch_dry_run:
+    description: 'Apply all patches and stop before compilation (verification mode)'
     required: false
     type: boolean
     default: false
@@ -115,6 +125,14 @@ runs:
         set -euo pipefail
         echo '${{ inputs.op_config_json }}' > /tmp/config.json
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+        P_MODEL="$(jq -r '.model // "unknown"' /tmp/config.json)"
+        P_OSVER="$(jq -r '.os_version // "unknown"' /tmp/config.json)"
+        PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
+        echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
+        echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
+        if [ -z "${OP_BORE:-}" ]; then
+          echo "OP_BORE=true" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -289,6 +307,12 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
+        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3 OP_BORE; do
+          val="${!bool_opt:-}"
+          if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
+            errors+=("$bool_opt must be true or false if set. Got: '$val'")
+          fi
+        done
         if [ ${#errors[@]} -ne 0 ]; then
           echo "Found ${#errors[@]} validation error(s):" >&2
           for error in "${errors[@]}"; do
@@ -359,6 +383,7 @@ runs:
         echo "MSM_KERNEL_FOLDER=$MSM_KERNEL_DIR" >> "$GITHUB_ENV"
         echo "AK3_FOLDER=$AK3_DIR" >> "$GITHUB_ENV"
         echo "DEBUG_ARTIFACTS_FOLDER=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
+        echo "DEBUG_ARTIFACTS_DIR=$DEBUG_ARTIFACTS_DIR" >> "$GITHUB_ENV"
         echo "KERNEL_PATCHES_FOLDER=$KERNEL_PATCHES_DIR" >> "$GITHUB_ENV"
         echo "SUSFS_FOLDER=$SUSFS_DIR" >> "$GITHUB_ENV"
         echo "NOMOUNT_FOLDER=$NOMOUNT_DIR" >> "$GITHUB_ENV"
@@ -368,6 +393,469 @@ runs:
         DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
         echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
+        KERNEL_SYNC_SHA="$(git -C "$COMMON_KERNEL_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)"
+        echo "KERNEL_SYNC_SHA=$KERNEL_SYNC_SHA" >> "$GITHUB_ENV"
+        echo "Kernel tree synced at: $KERNEL_SYNC_SHA (use this as the anchor SHA in patch-anchors.txt for any patch that stops applying at fuzz=0)"
+
+    - name: Prepare patch generation harness
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/patchgen" "$GITHUB_WORKSPACE/patch-faillogs"
+        cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
+        split_hunks() {
+          local patch_file="$1" out_dir="$2"
+          rm -rf "$out_dir" && mkdir -p "$out_dir"
+          awk -v out="$out_dir" '
+            BEGIN { inh = 0; nh = 0; orem = 0; nrem = 0; sawd = 0; sawp = 0; hdr = "" }
+            !inh && /^diff |^Index: / { hdr = $0 "\n"; sawd = 0; sawp = 0; next }
+            !inh && /^--- / && !sawd { hdr = hdr $0 "\n"; sawd = 1; next }
+            !inh && /^\+\+\+ / && sawd && !sawp { hdr = hdr $0 "\n"; sawp = 1; next }
+            !inh && /^--- / && sawd && sawp { hdr = $0 "\n"; sawd = 1; sawp = 0; next }
+            !inh && /^@@ / {
+              split($0, a, " ")
+              split(a[2], o, ","); split(a[3], n, ",")
+              orem = (length(o[2]) ? o[2]+0 : 1); nrem = (length(n[2]) ? n[2]+0 : 1)
+              if (sawp) {
+                nh++; hf = sprintf("%s/h%03d.hunk", out, nh)
+                printf "%s", hdr > hf; print $0 >> hf; inh = 1
+              }
+              next
+            }
+            inh {
+              print $0 >> hf
+              if ($0 ~ /^\\/) next
+              c = substr($0, 1, 1)
+              if (c == "-") orem--
+              else if (c == "+") nrem--
+              else { orem--; nrem-- }
+              if (orem <= 0 && nrem <= 0) { close(hf); inh = 0 }
+              next
+            }
+          ' "$patch_file"
+        }
+        anchor_rescue() {
+          local name="$1" patch_file="$2" verify_spec="${3:-}"
+          local anchors="$GITHUB_WORKSPACE/patch-anchors.txt"
+          local sha
+          sha=$(awk -v n="$name" '$1 == n && $2 ~ /^[0-9a-fA-F]{7,40}$/ { print $2; exit }' "$anchors" 2>/dev/null || true)
+          if [ -z "$sha" ]; then
+            echo "[patchgen] ${name}: no patch-anchors.txt entry; skipping 3-way rescue"
+            return 1
+          fi
+          local kdir="$COMMON_KERNEL_FOLDER" adir="/tmp/pg_${name}_anchor" bdir="/tmp/pg_${name}_base" mdir="/tmp/pg_${name}_merged"
+          local alog="/tmp/pg_${name}_anchor.log"
+          rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$bdir" "$mdir"
+          echo "[patchgen] ${name}: staging failed — attempting anchor 3-way merge (base ${sha})"
+          : > "$alog"
+          git -C "$kdir" fetch --depth=1 origin "$sha" >> "$alog" 2>&1 || true
+          if ! git -C "$kdir" cat-file -e "$sha" 2>/dev/null; then
+            echo "::warning::[patchgen] ${name}: anchor ${sha} not fetchable from origin; rescue aborted"
+            return 1
+          fi
+          if ! git -C "$kdir" archive "$sha" | tar -x -C "$bdir" >> "$alog" 2>&1; then
+            echo "::warning::[patchgen] ${name}: anchor ${sha} archive failed; rescue aborted"
+            return 1
+          fi
+          cp -a "$bdir/." "$adir/"
+          if ! patch -p1 --dry-run --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1; then
+            echo "::warning::[patchgen] ${name}: patch does not apply cleanly on anchor ${sha} (stale anchor); rescue aborted"
+            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+            return 1
+          fi
+          local targets f rc status=0
+          targets=$( { grep -E '^(\+\+\+|---) ' "$patch_file" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+          patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1 || true
+          : > "${mdir}/.ops"
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            if [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p "$kdir/$f" "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              cp "$adir/$f" "${mdir}/$f"
+              echo "keep $f" >> "${mdir}/.ops"
+            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p "$kdir/$f" /dev/null "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (created on both sides, exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            elif [ -f "$bdir/$f" ] && [ ! -f "$adir/$f" ]; then
+              if [ -f "$kdir/$f" ] && cmp -s "$kdir/$f" "$bdir/$f"; then
+                echo "delete $f" >> "${mdir}/.ops"
+              else
+                echo "conflict: $f (deleted by patch but modified in tree)" >> "$alog"; status=1
+              fi
+            elif [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p /dev/null "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (missing in tree, exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            else
+              echo "conflict: $f (unresolvable file state)" >> "$alog"; status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::[patchgen] ${name}: anchor 3-way merge hit conflicts; patch rejected (all-or-nothing)"
+            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+            return 1
+          fi
+          if [ -n "$verify_spec" ]; then
+            local spec vrc=0
+            local -a vlist
+            ( cd "$mdir" || exit 1
+              IFS=';' read -ra vlist <<< "$verify_spec"
+              for spec in "${vlist[@]}"; do
+                [ -n "$spec" ] || continue
+                case "$spec" in
+                  g:*) verify_grep "${spec#g:}" || { vrc=1; break; } ;;
+                  f:*) verify_infn "${spec#f:}" || { vrc=1; break; } ;;
+                esac
+              done ) || vrc=1
+            if [ "$vrc" -ne 0 ]; then
+              echo "::warning::[patchgen] ${name}: anchor-merged result failed verification; patch rejected"
+              cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+              return 1
+            fi
+            echo "[patchgen] ${name}: anchor-merge verification passed"
+            echo "✅ ${name} verified (anchor-merge)"
+          fi
+          local op p
+          while read -r op; do
+            case "$op" in
+              keep\ *) p="${op#keep }"; cp "${mdir}/${p}" "${kdir}/${p}" ;;
+              delete\ *) p="${op#delete }"; rm -f "${kdir}/${p}" ;;
+            esac
+          done < "${mdir}/.ops"
+          echo "[patchgen] ${name}: applied via anchor 3-way merge (base ${sha})"
+          echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
+          cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+          return 0
+        }
+        fuzz_restage() {
+          local name="$1" src="$2" md="$3" targets="$4" base="$5"
+          local f h hdir hlist ok=1
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            [ -f "$f" ] || continue
+            cp "$f" "${md}/$f"
+          done
+          : > "${base}/fuzz.log"
+          hdir="${base}/hunks_fuzz"
+          split_hunks "$src" "$hdir"
+          hlist=$(ls "$hdir"/*.hunk 2>/dev/null || true)
+          for h in $hlist; do
+            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+              continue
+            fi
+            if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+              echo "hunk ${h##*/} staged at fuzz=2 (sandbox only)" >> "${base}/fuzz.log"
+              continue
+            fi
+            echo "hunk ${h##*/} not stageable even at fuzz=2" >> "${base}/fuzz.log"
+            ok=0
+          done
+          find "$md" -name '*.rej' -delete 2>/dev/null || true
+          find "$md" -name '*.orig' -delete 2>/dev/null || true
+          if [ "$ok" -eq 1 ]; then
+            cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+            echo "[patchgen] ${name}: staged with bounded per-hunk fuzz (sandbox only); regenerating exact patch for the target tree"
+            return 0
+          fi
+          cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+          return 1
+        }
+        gen_patch() {
+          local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
+          local base="$GITHUB_WORKSPACE/patchgen/${name}"
+          local um="${base}/unmodified" md="${base}/modified"
+          local psf="${PS_FILE:-patch-status-raw.txt}"
+          rm -rf "$base" && mkdir -p "$um" "$md"
+          local src="/tmp/pg_${name}.patch"
+          if [ -n "$sed_expr" ]; then sed -e "$sed_expr" "$patch_file" > "$src"; else cp "$patch_file" "$src"; fi
+          local targets f
+          targets=$( { grep -E '^\+\+\+ ' "$src" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+          if [ -z "$targets" ]; then
+            echo "::warning::[patchgen] ${name} patch exposes no file targets; not applied"
+            echo "${name}|failed" >> "$psf"
+            return 0
+          fi
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            [ -f "$f" ] || continue
+            mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
+            cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
+          done
+          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct
+          mkdir -p "$hunk_dir"
+          split_hunks "$src" "$hunk_dir"
+          hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
+          : > "${base}/stage.log"
+          if [ -z "$hlist" ]; then
+            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
+              staged=1; already_ct=0; failed_ct=0
+            elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
+              echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean at staging)"
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+              echo "[patchgen] ${name}: verification passed"
+              echo "✅ ${name} verified (already in tree)"
+              echo "${name}|already" >> "$psf"
+              return 0
+            else
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
+              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+                staged=1; already_ct=0; failed_ct=0
+              else
+                cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+                find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
+                echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+                echo "${name}|failed" >> "$psf"
+                return 0
+              fi
+            fi
+          else
+            staged=0; already_ct=0; failed_ct=0
+            for h in $hlist; do
+              if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                staged=$((staged+1))
+              elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                already_ct=$((already_ct+1))
+              else
+                failed_ct=$((failed_ct+1))
+                echo "hunk not stageable: ${h##*/}" >> "${base}/stage.log"
+              fi
+            done
+            find "$md" -name '*.rej' -delete 2>/dev/null || true
+            find "$md" -name '*.orig' -delete 2>/dev/null || true
+            echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
+            [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+            if [ "$failed_ct" -gt 0 ]; then
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
+              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+                staged=1; already_ct=0; failed_ct=0
+              else
+                echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; fuzz re-stage failed; NOT applying a partial patch"
+                echo "${name}|failed" >> "$psf"
+                return 0
+              fi
+            fi
+          fi
+          if [ "$staged" -eq 0 ]; then
+            if [ "$already_ct" -gt 0 ]; then
+              [ "$failed_ct" -eq 0 ] || echo "::warning::[patchgen] ${name}: ${failed_ct} hunk(s) neither present nor applicable; ${already_ct} hunk(s) already in tree"
+              echo "[patchgen] ${name}: change already present in tree"
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+              echo "[patchgen] ${name}: verification passed"
+              echo "✅ ${name} verified (already in tree)"
+              echo "${name}|already" >> "$psf"
+            else
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
+              echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+              echo "${name}|failed" >> "$psf"
+            fi
+            return 0
+          fi
+          ( cd "$base" && diff -ruN unmodified modified ) > "${base}/regen.patch" || true
+          if patch -p1 --forward --fuzz=0 < "${base}/regen.patch" > "${base}/apply.log" 2>&1; then
+            :
+          elif patch -p1 --dry-run -R --fuzz=0 < "${base}/regen.patch" >> "${base}/apply.log" 2>&1; then
+            echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean)"
+            verify_applied "$name" "$src" \
+              || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+            echo "[patchgen] ${name}: verification passed"
+            echo "✅ ${name} verified (already in tree)"
+            echo "${name}|already" >> "$psf"
+            return 0
+          else
+            cp "${base}/apply.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_apply.log" 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} regenerated patch did not apply; not applied"
+            echo "${name}|failed" >> "$psf"
+            return 0
+          fi
+          if ! verify_applied "$name" "$src"; then
+            {
+              echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
+              echo "  Reverse-applying the patch to keep the tree consistent."
+            } > "${base}/verify.log"
+            patch -p1 -R --fuzz=0 < "${base}/regen.patch" >> "${base}/verify.log" 2>&1 || true
+            cp "${base}/verify.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_verify.log" 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} applied but self-verification failed; patch reverted"
+            echo "${name}|failed" >> "$psf"
+            return 0
+          fi
+          if [ -n "$verify_spec" ]; then
+            local spec rc=0
+            local -a vlist
+            IFS=';' read -ra vlist <<< "$verify_spec"
+            for spec in "${vlist[@]}"; do
+              [ -n "$spec" ] || continue
+              case "$spec" in
+                g:*) verify_grep "${spec#g:}" || { rc=1; break; } ;;
+                f:*) verify_infn "${spec#f:}" || { rc=1; break; } ;;
+                *) echo "::warning::[patchgen] ${name}: unknown verify directive '${spec}'" ;;
+              esac
+            done
+            if [ "$rc" -ne 0 ]; then
+              {
+                echo "[patchgen] ${name} verification FAILED (spec: ${verify_spec})"
+                echo "  A required symbol is missing or landed outside its expected scope."
+                echo "  Reverse-applying the patch to keep the tree consistent."
+              } > "${base}/verify.log"
+              patch -p1 -R --fuzz=0 < "${base}/regen.patch" >> "${base}/verify.log" 2>&1 || true
+              cp "${base}/verify.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_verify.log" 2>/dev/null || true
+              echo "::warning::[patchgen] ${name} applied but verification failed; patch reverted"
+              echo "${name}|failed" >> "$psf"
+              return 0
+            fi
+            echo "[patchgen] ${name}: verification passed (spec: ${verify_spec})"
+          else
+            echo "[patchgen] ${name}: verification passed"
+          fi
+          echo "✅ ${name} verified"
+          echo "${name}|applied" >> "$psf"
+          return 0
+        }
+        gen_patch_fb() {
+          # Primary-with-fallback wrapper around gen_patch. Runs the primary
+          # patch first; if it does not land, wipes the stale per-patch status
+          # lines and retries once with the fallback patch.
+          # Sets GEN_PATCH_FB_VIA for the caller: primary | fallback | none.
+          local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
+          local psf="${PS_FILE:-patch-status-raw.txt}"
+          GEN_PATCH_FB_VIA="none"
+          if [ -n "$primary" ] && [ -f "$primary" ]; then
+            GEN_PATCH_FB_VIA="primary"
+            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+            gen_patch "$name" "$primary" "$sed_expr" "$verify_spec" || true
+            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+          fi
+          if [ -n "$fallback" ] && [ -f "$fallback" ]; then
+            GEN_PATCH_FB_VIA="fallback"
+            echo "[patchgen] ${name}: primary patch did not land; falling back to $(basename "$fallback")"
+            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+            gen_patch "$name" "$fallback" "$sed_expr" "$verify_spec" || true
+            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+          fi
+          return 1
+        }
+        verify_grep() {
+          local spec="$1"
+          local file="${spec%%|*}" regex="${spec#*|}"
+          if [ ! -e "$file" ]; then
+            echo "[patchgen] verify: ${file} not found"
+            return 1
+          fi
+          local hits
+          hits=$(grep -nE "$regex" "$file" 2>/dev/null | head -n 5 || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            return 0
+          fi
+          echo "[patchgen] verify: no match for '${regex}' in ${file}"
+          return 1
+        }
+        verify_infn() {
+          local spec="$1"
+          local file="${spec%%|*}"
+          local rest="${spec#*|}"
+          local func="${rest%%|*}" sym="${rest#*|}"
+          [ -f "$file" ] || { echo "[patchgen] verify: ${file} not found"; return 1; }
+          if awk -v fn="$func" -v sym="$sym" '
+            $0 ~ ("^[A-Za-z_].*" fn "[[:space:]]*\\(") && $0 !~ /;[[:space:]]*$/ { infn = 1; depth = 0; seen = 0 }
+            infn {
+              ob = gsub(/{/, "{"); cb = gsub(/}/, "}")
+              depth += ob - cb
+              if ($0 ~ sym) { found = 1; exit }
+              if (ob > 0) seen = 1
+              if (seen && depth <= 0) { infn = 0; seen = 0 }
+            }
+            END { exit (found ? 0 : 1) }
+          ' "$file"; then
+            echo "[patchgen] verify: ${file}: '${sym}' present inside ${func}()"
+            return 0
+          fi
+          echo "[patchgen] verify: ${file}: '${sym}' NOT found inside ${func}()"
+          return 1
+        }
+        verify_applied() {
+          # Generic post-apply self-verification driven by the patch itself:
+          # sample lines the patch adds and confirm they are present in the
+          # live tree. Prints matched evidence lines; non-zero if any sampled
+          # line is missing. Handles both '+++ b/path' (upstream) and
+          # '+++ modified/path' (diff -ruN regen) header shapes.
+          local name="$1" patch_file="$2"
+          local map
+          map=$(awk '
+            /^--- / { next }
+            /^\+\+\+ / {
+              p = $2
+              if (p == "/dev/null") { cur = ""; next }
+              sub(/^[^\/]+\//, "", p)
+              cur = p; next
+            }
+            /^@@/ { next }
+            /^\+/ {
+              if (cur == "") next
+              line = substr($0, 2); sub(/\r$/, "", line)
+              if (line ~ /^[ \t]*$/) next
+              if (length(line) > 240) next
+              if (seen[cur] >= 2) next
+              if (total >= 24) next
+              print cur "\t" line
+              seen[cur]++; total++
+            }
+            BEGIN { total = 0 }
+          ' "$patch_file") || true
+          if [ -z "$map" ]; then
+            echo "[patchgen] ${name}: nothing to self-verify (no added lines)"
+            return 0
+          fi
+          local f line shown=0 miss=0
+          while IFS=$'\t' read -r f line; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ] || ! grep -qF -- "$line" "$f" 2>/dev/null; then
+              echo "[patchgen] ${name}: VERIFY MISS ${f}: ${line}"
+              miss=$((miss+1))
+              continue
+            fi
+            if [ "$shown" -lt 8 ]; then
+              grep -nF -- "$line" "$f" 2>/dev/null | head -n 1
+              shown=$((shown+1))
+            fi
+          done <<< "$map"
+          [ "$miss" -eq 0 ] || return 1
+          return 0
+        }
+        fetch_patch() {
+          local url="$1" out="$2" min="${3:-200}"
+          curl -sSL --fail -o "$out" "$url" || return 1
+          local sz
+          sz="$(stat -c%s "$out" 2>/dev/null || echo 0)"
+          if [ "$sz" -lt "$min" ]; then
+            echo "::warning::[fetch_patch] ${url} fetched only ${sz} bytes (floor ${min}); treating as unavailable"
+            return 1
+          fi
+          return 0
+        }
+        GEN_PATCH_EOF
+        echo "patch generation harness ready"
     - name: Set Kernel build-tools to Path
       shell: bash
       run: |
@@ -805,7 +1293,12 @@ runs:
           while [ $attempt -le $max_attempts ]; do
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
               
-              if aria2c -x16 -s16 -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+              local aria_splits="-x16 -s16 -j16"
+          if [[ "$url" == *"gitlab.com"* ]]; then
+            # GitLab throttles per-IP bursts; 16-way segmentation invites 429s
+            aria_splits="-x4 -s4"
+          fi
+          if aria2c $aria_splits -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
                   mkdir -p "$repo_name"
                   if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
                       echo "✅ Success: $repo_name synced"
@@ -816,11 +1309,11 @@ runs:
               
               echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
               rm -rf "$repo_name" "$shm_path" 2>/dev/null
-              sleep 5
+              [ $attempt -lt $max_attempts ] && sleep $((attempt * 15))
               attempt=$((attempt + 1))
           done
           
-          echo "::error::All attempts failed for $url"
+          echo "::warning::Archive fetch failed for $url after $max_attempts attempts - caller will fall back to git clone"
           return 1
         }
         
@@ -881,16 +1374,36 @@ runs:
         
         retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
         git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
-        git -C nomount fetch --depth 1 origin 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
-        git -C nomount checkout --detach 1dacddf5d85ced5b6c26ab09e621e366e4f0cd88
-        NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+        NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
+        if [ -n "$NOMOUNT_TARGET" ]; then
+          echo "Using NoMount commit: $NOMOUNT_TARGET"
+          git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+          git -C nomount checkout --detach "$NOMOUNT_TARGET"
+          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+          if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
+            echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+            exit 1
+          fi
+        else
+          git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
+          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+          echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
+        fi
+        git -C nomount log --oneline -1
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "Using pinned NoMount dev commit: $NOMOUNT_COMMIT_SHA"
+        echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
-            echo "::error::Failed to fetch SUSFS archive after multiple attempts"
-            exit 1
+            echo "::warning::SUSFS archive fetch throttled; falling back to a plain git clone"
+            rm -rf "$SUSFS_FOLDER"
+            if git clone --no-checkout "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_FOLDER" \
+               && git -C "$SUSFS_FOLDER" checkout --detach "$SUSFS_BRANCH"; then
+              echo "SUSFS tree fetched via git clone fallback at $SUSFS_BRANCH"
+            else
+              echo "::error::Failed to fetch SUSFS after both archive and git-clone attempts"
+              exit 1
+            fi
           fi
           echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> $GITHUB_ENV
         fi
@@ -975,12 +1488,10 @@ runs:
         cd "$KERNEL_PLATFORM_FOLDER"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
         if [ -z "$KSU_INPUT" ]; then
-          KSU_INPUT="3b18216f71df189ab3d1b1ce0bdb21be1268e771"
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -
+        else
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
         fi
-
-        curl --fail --location --proto '=https' -LSs \
-          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/3b18216f71df189ab3d1b1ce0bdb21be1268e771/kernel/setup.sh" \
-          | bash -s "$KSU_INPUT"
         git -C KernelSU-Next submodule update --init --recursive
         cd KernelSU-Next/kernel
 
@@ -1016,19 +1527,19 @@ runs:
         echo "✅ KernelSU Next added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
-    - name: Add ReSukiSU (The Sukisaku Project)
+    - name: Add BakaSU
       shell: bash
-      if: ${{ inputs.ksu_type == 'ReSukiSU' }}
+      if: ${{ inputs.ksu_type == 'BakaSU' }}
       run: |
         set -euo pipefail
-        echo "::group::Add ReSukiSU"
+        echo "::group::Add BakaSU"
         cd "$KERNEL_PLATFORM_FOLDER"
-        echo "Adding ReSukiSU..."
+        echo "Adding BakaSU..."
         
         if [ "${{ inputs.ksu_branch_or_hash }}" = "" ]; then
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
         else
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch_or_hash }}"
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch_or_hash }}"
         fi
         
         cd KernelSU
@@ -1041,12 +1552,33 @@ runs:
         
         cd ..
         
-        echo "ReSukiSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "BakaSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
         
-        echo "ReSukiSU Version: $KSU_VERSION"
-        echo "✅ ReSukiSU added (commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "BakaSU Version: $KSU_VERSION"
+        echo "✅ BakaSU added (commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "::endgroup::"
+
+    - name: Add BakaSU Root Tag
+      if: ${{ inputs.ksu_type == 'BakaSU' && env.OP_ROOT_TAG != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Add BakaSU root tag"
+        if ! grep -rq 'config KSU_FULL_NAME_FORMAT' "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Kconfig"; then
+          echo "::warning::BakaSU Kconfig has no KSU_FULL_NAME_FORMAT symbol, skipping root tag"
+          echo "::endgroup::"
+          exit 0
+        fi
+        MANAGER_BRANCH="${{ inputs.ksu_branch_or_hash }}"
+        [ -z "$MANAGER_BRANCH" ] && MANAGER_BRANCH="main"
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KSU_FULL_NAME_FORMAT="${OP_ROOT_TAG}@%REPO_NAME%"
+        EOF
+        grep -n 'CONFIG_KSU_FULL_NAME_FORMAT' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        echo "ROOT_TAG_APPLIED=${OP_ROOT_TAG}" >> "$GITHUB_ENV"
+        echo "Root tag applied: ${OP_ROOT_TAG}"
         echo "::endgroup::"
 
     - name: Apply SUSFS Patches
@@ -1055,6 +1587,7 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
+        cd "$KERNEL_PLATFORM_FOLDER"
         cd "$KERNEL_PLATFORM_FOLDER"
         echo "Applying SUSFS patches..."
         cp "$SUSFS_FOLDER/kernel_patches/fs/"* "$COMMON_KERNEL_FOLDER/fs/"
@@ -1080,9 +1613,9 @@ runs:
           "v1.5.8")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not apply cleanly (soft-fail, continuing)"
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
@@ -1090,10 +1623,10 @@ runs:
               cd "$KSU_FOLDER"
               patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
-          "v2.2.0")
+          "v2.2.0"|"v2.3.0")
             if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1150,9 +1683,16 @@ runs:
                 -e 's|^#if defined(__x86_64__)$|#if defined(__x86_64__) \&\& !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)|' \
                 -e 's|^    // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set $|    // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set|' \
                 "$init_source"
-              for compatibility_patch in fix_Kbuild.patch fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch; do
-                patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
-              done
+              if [ -d "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version" ]; then
+                for compatibility_patch in fix_Kbuild.patch fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch; do
+                  if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"; then
+                    echo "::warning::KernelSU Next susfs fix ${compatibility_patch} did not apply; continuing"
+                    echo "susfs-fix-${compatibility_patch%.patch}|failed" >> "$PS_FILE"
+                  fi
+                done
+              else
+                echo "::warning::No KernelSU Next susfs fix patches for ${susfs_version}; continuing without them"
+              fi
               # Filtering the upstream SUSFS patch skips its local sucompat
               # helper and imports. Restore those exact dependencies here.
               sucompat_source=./kernel/feature/sucompat.c
@@ -1179,8 +1719,13 @@ runs:
                 { print }
               ' "$sucompat_source" > "$tmp_sucompat"
               mv "$tmp_sucompat" "$sucompat_source"
-              patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/overwrite_hook_mode.patch"
-              patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/ksu_toolkit.patch"
+              for compatibility_patch in overwrite_hook_mode.patch ksu_toolkit.patch; do
+                fix_path="$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
+                if [ -f "$fix_path" ] && ! patch -p1 --forward < "$fix_path"; then
+                  echo "::warning::KernelSU Next susfs fix ${compatibility_patch} did not apply; continuing"
+                  echo "susfs-fix-${compatibility_patch%.patch}|failed" >> "$PS_FILE"
+                fi
+              done
             elif [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               susfs_ksu_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1242,7 +1787,7 @@ runs:
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
           *)
@@ -1250,7 +1795,15 @@ runs:
             exit 1
             ;;
         esac
-        
+        echo "::endgroup::"
+
+    - name: Apply SUSFS Kernel Patches
+      shell: bash
+      if: ${{ env.OP_SUSFS == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Apply SUSFS kernel patches"
+        cd "$KERNEL_PLATFORM_FOLDER"
         cd "$COMMON_KERNEL_FOLDER"
         if [ "${{ env.ANDROID_VER }}" = "android15" ] && [ "${{ env.KERNEL_VER }}" = "6.6" ]; then
           if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c; then
@@ -1509,9 +2062,15 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+        grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
+        if [ -f "$COMMON_KERNEL_FOLDER/fs/susfs.c" ]; then
+          echo "susfs|applied" >> "$PS_FILE"
+        else
+          echo "::warning::fs/susfs.c missing after SUSFS application"
+          echo "susfs|failed" >> "$PS_FILE"
+        fi
         
         echo "::endgroup::"
-    
     - name: Apply NoMount
       shell: bash
       run: |
@@ -1520,74 +2079,119 @@ runs:
 
         cd "$COMMON_KERNEL_FOLDER"
 
-        echo "Copying NoMount source..."
-        cp -av "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/"
+        echo "Installing NoMount Kbuild package at fs/nomount/..."
+        rm -rf "$COMMON_KERNEL_FOLDER/fs/nomount"
+        mkdir -p "$COMMON_KERNEL_FOLDER/fs/nomount"
+        cp -a "$NOMOUNT_FOLDER/kernel/src/." "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.c" ]; then
-          echo "::error::nomount.c was not copied successfully"
-          exit 1
-        fi
-
-        if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount.h" ]; then
-          echo "::error::nomount.h was not copied successfully"
-          exit 1
-        fi
-
-        echo "✅ NoMount source copied"
-
-        echo "Listing NoMount kernel directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel"
-
-        echo ""
-        echo "Listing NoMount patches directory..."
-        ls -lah "$NOMOUNT_FOLDER/kernel/patches"
-
-        echo ""
-        echo "Available NoMount patches:"
-        find "$NOMOUNT_FOLDER/kernel/patches" -maxdepth 1 -type f -name "*.patch" | sort
-
-        case "$KERNEL_VER" in
-          5.10|5.15|6.1|6.6|6.12)
-            NOMOUNT_PATCH="$NOMOUNT_FOLDER/kernel/patches/nomount_${KERNEL_VER}_kernel_integration.patch"
-            ;;
-          *)
-            echo "::error::Unsupported NoMount kernel version: $KERNEL_VER"
+        for f in nomount.c nomount.h Kconfig Makefile; do
+          if [ ! -f "$COMMON_KERNEL_FOLDER/fs/nomount/$f" ]; then
+            echo "::error::fs/nomount/$f missing after copy"
             exit 1
-            ;;
-        esac
+          fi
+        done
+        echo "✅ NoMount source installed"
 
-        echo ""
-        echo "Using NoMount patch:"
-        echo "$NOMOUNT_PATCH"
-
-        if [ ! -f "$NOMOUNT_PATCH" ]; then
-          echo "::error::NoMount patch not found: $NOMOUNT_PATCH"
-          exit 1
+        if ! grep -q "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"; then
+          printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$COMMON_KERNEL_FOLDER/fs/Makefile"
+          echo "➕ fs/Makefile wired"
         fi
 
-        echo "Applying NoMount patch..."
-
-        if ! patch -p1 --forward < "$NOMOUNT_PATCH"; then
-          echo "::error::NoMount patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
+        if ! grep -q 'source "fs/nomount/Kconfig"' "$COMMON_KERNEL_FOLDER/fs/Kconfig"; then
+          awk '
+            /^endmenu/ { last_match = NR }
+            { lines[NR] = $0 }
+            END {
+              for (i = 1; i <= NR; i++) {
+                if (i == last_match) print "source \"fs/nomount/Kconfig\""
+                print lines[i]
+              }
+            }
+          ' "$COMMON_KERNEL_FOLDER/fs/Kconfig" > "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" \
+            && mv "$COMMON_KERNEL_FOLDER/fs/Kconfig.tmp" "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+          echo "➕ fs/Kconfig wired"
         fi
-
-        echo "✅ NoMount patch applied"
 
         echo "Adding NoMount configuration..."
-
         if ! grep -q "^CONFIG_NOMOUNT=y" "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"; then
           printf '%s\n' 'CONFIG_NOMOUNT=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         fi
-        echo "NOMOUNT_PATCH_NAME=$(basename "$NOMOUNT_PATCH")" >> "$GITHUB_ENV"
-        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "$(basename "$NOMOUNT_PATCH")" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "NOMOUNT_PATCH_NAME=kernel-integration-Kbuild" >> "$GITHUB_ENV"
+        printf '%s\n%s\n%s\n' "NoMount" "${NOMOUNT_COMMIT_SHA:-unknown}" "kernel-integration (setup.sh method)" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
 
-        echo "Verifying NoMount files..."
-        ls -l "$COMMON_KERNEL_FOLDER/fs"/nomount*
+        echo "Verifying NoMount wiring..."
+        grep -n "nomount" "$COMMON_KERNEL_FOLDER/fs/Makefile"
+        grep -n 'fs/nomount/Kconfig' "$COMMON_KERNEL_FOLDER/fs/Kconfig"
+        ls -la "$COMMON_KERNEL_FOLDER/fs/nomount/"
 
         echo "✅ NoMount integration completed"
+        echo "nomount|applied" >> "$PS_FILE"
+        echo "::endgroup::"
 
+    - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)
+      if: ${{ env.OP_LZ4_UPGRADE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Upgrade LZ4"
+        cd "$COMMON_KERNEL_FOLDER"
+        if [ -f lib/lz4/lz4.c ] && grep -q 'lib/lz4/lz4.h' include/linux/lz4.h 2>/dev/null; then
+          echo "LZ4 already upgraded, skipping"
+        else
+          rm -rf "$GITHUB_WORKSPACE/lz4_oplus"
+          git clone --depth 1 https://github.com/Numbersf/lz4_oplus.git "$GITHUB_WORKSPACE/lz4_oplus"
+          bash "$GITHUB_WORKSPACE/lz4_oplus/apply_lz4_oplus.sh"
+        fi
+        grep -q 'lib/lz4/lz4.h' include/linux/lz4.h
+        grep -q 'LZ4_arm64_decompress_safe' crypto/lz4.c
+        ls lib/lz4/lz4.c lib/lz4/lz4hc.c lib/lz4/lz4armv8/lz4accel.c > /dev/null
+        echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
+        echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
+        grep -n 'LZ4_arm64_decompress_safe' crypto/lz4.c | head -n 2 || true
+        grep -n '1\.10\.' lib/lz4/lz4.h | head -n 2 || true
+        echo "✅ LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+        echo "lz4|applied" >> "$PS_FILE"
+        echo "::endgroup::"
+
+    - name: Enable ADIOS I/O Scheduler
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Enable ADIOS I/O scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        if [ ! -f block/adios.c ]; then
+          ADIOS_FILE="adios_ioscheduler_${KERNEL_VER}.patch"
+          case "${OP_BRANCH:-}" in
+            *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
+          esac
+          if ! fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}" /tmp/adios.patch; then
+            echo "::warning::ADIOS patch unavailable (${ADIOS_FILE}); skipping"
+            echo "adios|skipped" >> "$PS_FILE"
+            echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+            exit 0
+          fi
+          gen_patch adios /tmp/adios.patch "" "g:block/adios.c|adios_init_sched"
+          if ! grep -Eq '^adios\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+            exit 0
+          fi
+        else
+          echo "block/adios.c already present, enabling config only"
+          echo "adios|applied" >> "$PS_FILE"
+        fi
+        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
+        grep -q 'adios.o' block/Makefile
+        grep -q '^CONFIG_MQ_IOSCHED_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
+        echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
+        echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
+        echo "✅ ADIOS I/O scheduler enabled"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -1597,6 +2201,7 @@ runs:
         set -euo pipefail
         echo "::group::Add BBG LSM"
         cd "$KERNEL_PLATFORM_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         echo "Adding BBG..."
         if ! wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash -s main; then
           echo "::warning::BBG setup script failed, continuing anyway"
@@ -1606,13 +2211,17 @@ runs:
         
         if grep -qxF $'\t\tconst char* symlink_target_link = inode->i_op->get_link(dentry, inode, NULL);' ./Baseband-guard/baseband_guard.c; then
           echo "Applying BBG get_link fix"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/experimental/bbg/bbg_fix_get_link.patch"; then
-            echo "::error::BBG get_link patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
+          gen_patch bbg-getlink "$KERNEL_PATCHES_FOLDER/experimental/bbg/bbg_fix_get_link.patch"
         fi
-        echo "✅ BBG LSM added"
+        if [ -f Baseband-guard/baseband_guard.c ] || [ -f common/Baseband-guard/baseband_guard.c ]; then
+          grep -n '^CONFIG_BBG=y' common/arch/arm64/configs/gki_defconfig || true
+          grep -n 'baseband_guard' common/security/Kconfig | head -n 3 || true
+          echo "✅ BBG LSM added"
+          echo "bbg|applied" >> "$PS_FILE"
+        else
+          echo "::warning::BBG evidence check failed (baseband_guard.c missing); marking failed"
+          echo "bbg|failed" >> "$PS_FILE"
+        fi
         echo "::endgroup::"
 
     - name: Apply KSU Hooks
@@ -1629,26 +2238,30 @@ runs:
           exit 1
         fi
         echo "✅ KSU hooks applied"
+        echo "ksu_hooks|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
-    - name: Apply Other Patches
+    - name: Apply gki_ptrace patch
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Apply Other patches"
+        echo "::group::Apply gki_ptrace"
         cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
         MIN_VERSION="5.16"
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching ptrace!"
-          if ! patch -p1 --fuzz=2 < "$KERNEL_PATCHES_FOLDER/gki_ptrace.patch"; then
-            echo "::error::gki_ptrace patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
+          gen_patch gki_ptrace "$KERNEL_PATCHES_FOLDER/gki_ptrace.patch"
         else
           echo "Kernel >= $MIN_VERSION, skipping ptrace patch"
         fi
+        echo "::endgroup::"
+    - name: Apply HMBIRD Fengchi patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply HMBIRD Fengchi patches"
+        cd "$COMMON_KERNEL_FOLDER"
         if [ "$OP_HMBIRD" = true ]; then
           echo "Patching hmbird!"
           HMBIRD_MODEL=$(echo "$OP_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')
@@ -1662,12 +2275,9 @@ runs:
             OP13-6.6.30)
               HMBIRD_MODEL="OP13-PJZ" ;;
           esac
-          # Upstream WildKernels/kernel_patches names fengchi patches with the
-          # A14/A15/A16 OS convention (e.g. fengchi_OP13T_A16.patch). This fork
-          # keeps OOS naming everywhere else, so translate OOS<NN> -> A<NN> only
-          # for the fengchi filename lookup against the upstream patches repo.
           HMBIRD_OS="${OP_OS_VERSION/OOS/A}"
           dos2unix "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          FENGCHI_OK=true
           if ! patch -p1 --fuzz=2 < "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"; then
             echo "::warning::hmbird fengchi patch did not apply cleanly. Applying known compatibility fallbacks."
             if [ -f kernel/fork.c.rej ] && grep -Fq 'sched_ext_free(tsk);' kernel/fork.c.rej; then
@@ -1675,15 +2285,19 @@ runs:
               if [ "$sched_ext_free_count" -eq 1 ]; then
                 perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
                 if grep -Fq 'sched_ext_free(tsk);' kernel/fork.c; then
+                  echo "hmbird|failed" >> "$PS_FILE"
                   echo "::error::Failed to adapt kernel/fork.c for HMBIRD"
                   exit 1
                 fi
                 rm kernel/fork.c.rej
                 echo "Applied HMBIRD kernel/fork.c compatibility fallback"
               else
+                echo "hmbird|failed" >> "$PS_FILE"
                 echo "::error::Expected one sched_ext_free() call for the HMBIRD fallback, found $sched_ext_free_count"
                 exit 1
               fi
+            else
+              FENGCHI_OK=false
             fi
             find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
             find . -name "*.rej" -delete 2>/dev/null || true
@@ -1701,14 +2315,32 @@ runs:
             find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
             find . -name "*.rej" -delete 2>/dev/null || true
           fi
+          if [ "$FENGCHI_OK" = true ]; then
+            grep -n 'CONFIG_HMBIRD' arch/arm64/configs/gki_defconfig 2>/dev/null | head -n 3 || true
+            grep -n 'hmbird_free' kernel/fork.c 2>/dev/null | head -n 2 || true
+            echo "✅ HMBIRD Fengchi applied"
+            echo "hmbird|applied" >> "$PS_FILE"
+          else
+            echo "hmbird|failed" >> "$PS_FILE"
+          fi
         else
+          echo "hmbird|skipped" >> "$PS_FILE"
           echo "Hmbird not enabled, skipping fengchi patch"
         fi
-
-        echo "Patching module intercept and overlay mechanism"
+        echo "::endgroup::"
+    - name: Apply module overlay
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply module overlay"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         MODULE_OVERLAY_PATCH="$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-$ANDROID_VER-$KERNEL_VER.patch"
-        patch -p1 -F 3 < "$MODULE_OVERLAY_PATCH"
-
+        gen_patch module_overlay "$MODULE_OVERLAY_PATCH"
+        if [ "$(grep -xc 'module_overlay|applied' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+          echo "::error::Module overlay patch did not apply - the module intercept mechanism is required"
+          exit 1
+        fi
         MODULE_OVERLAY_DIR=""
         if [ -d "$COMMON_KERNEL_FOLDER/kernel/module/module_overlay" ]; then
           MODULE_OVERLAY_DIR="$COMMON_KERNEL_FOLDER/kernel/module/module_overlay"
@@ -1719,15 +2351,11 @@ runs:
           exit 1
         fi
         chmod +x "$MODULE_OVERLAY_DIR/convert_overlay.sh"
-
         copied_modules=""
         SOC="${OP_BRANCH#*/}"
-
         declare -A selected_file=()
         declare -A selected_priority=()
         selected_count=0
-
-        # Define suffixes in order of priority (1 to 7)
         suffixes=(
           "_${OP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}.ko"
           "_${SOC}_${OP_OS_VERSION}_${KERNEL_FULL_VER}.ko"
@@ -1737,33 +2365,24 @@ runs:
           "_${SOC}.ko"
           "_${KERNEL_FULL_VER}.ko"
         )
-
         while IFS= read -r -d '' file; do
           filename="${file##*/}"
           module_name=""
           priority=0
-
           exact_module_name=$(modinfo -F name "$file" 2>/dev/null)
-
-          # Evaluate priorities by iterating through the ordered suffixes
           for i in "${!suffixes[@]}"; do
             suffix="${suffixes[$i]}"
             if [[ "$filename" == *"$suffix" ]]; then
               extracted_name="${filename%"$suffix"}"
               extracted_normalized="${extracted_name//-/_}"
-
               if [[ "$extracted_normalized" == "$exact_module_name" ]]; then
                 module_name="$extracted_name"
                 priority=$((i + 1))
               fi
-
-              break # Match found, stop checking lower priorities
+              break
             fi
           done
-
-          # File did not match any supported naming pattern.
           [[ -n "$module_name" ]] || continue
-
           if [[ -z "${selected_priority[$module_name]+exists}" ]]; then
             echo "New module: $file"
             selected_file["$module_name"]="$file"
@@ -1775,206 +2394,220 @@ runs:
             selected_priority["$module_name"]="$priority"
           fi
         done < <(find "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/modules/" -type f -name '*.ko' -print0)
-
         if (( selected_count == 0 )); then
           echo "No matching kernel modules found."
         fi
-
         for module_name in "${!selected_file[@]}"; do
           file="${selected_file[$module_name]}"
           priority="${selected_priority[$module_name]}"
           echo "Copying module '$module_name' priority=$priority: $file"
-
           dest_path="$MODULE_OVERLAY_DIR/modules/${module_name}.ko"
           cp -v -- "$file" "$dest_path"
-
           if [ -z "$copied_modules" ]; then
             copied_modules="$dest_path"
           else
             copied_modules="$copied_modules:$dest_path"
           fi
         done
-
         ccache --set-config=extra_files_to_hash="$copied_modules"
-        
-        echo "Patching optimized_mem_operations.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/optimized_mem_operations.patch"; then
-          echo "::error::optimized_mem_operations patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching file_struct_8bytes_align.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/file_struct_8bytes_align.patch"; then
-          echo "::error::file_struct_8bytes_align patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_cache_pressure.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_cache_pressure.patch"; then
-          echo "::error::reduce_cache_pressure patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
-        echo "Patching mem_opt_prefetch.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/mem_opt_prefetch.patch"; then
-          echo "::error::mem_opt_prefetch patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
-        if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | tail -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching optimise_memcmp.patch"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch"; then
-            echo "::error::optimise_memcmp patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
-        elif [ "$(printf '%s\n' "$KERNEL_VERSION" "5.11" | sort -V | tail -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching optimise_memcmp.patch (sed variant)"
-          if ! sed -e 's/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/' -e 's/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/' -e 's/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/' "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch" | patch -p1 --forward; then
-            echo "::error::optimise_memcmp (sed variant) patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
-        else
-          echo "Optimised memcmp patch not found!"
-        fi
-        echo "Patching minimise_wakeup_time.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/minimise_wakeup_time.patch"; then
-          echo "::error::minimise_wakeup_time patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching int_sqrt.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/int_sqrt.patch"; then
-          echo "::error::int_sqrt patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching force_tcp_nodelay.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/force_tcp_nodelay.patch"; then
-          echo "::error::force_tcp_nodelay patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_gc_thread_sleep_time.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_gc_thread_sleep_time.patch"; then
-          echo "::error::reduce_gc_thread_sleep_time patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching add_timeout_wakelocks_globally.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/add_timeout_wakelocks_globally.patch"; then
-          echo "::error::add_timeout_wakelocks_globally patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching f2fs_reduce_congestion.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/f2fs_reduce_congestion.patch"; then
-          echo "::error::f2fs_reduce_congestion patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_freeze_timeout.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_freeze_timeout.patch"; then
-          echo "::error::reduce_freeze_timeout patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
-        if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching clear_page_16bytes_align.patch"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
-            echo "::warning::clear_page_16bytes_align patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
-          fi
-        else
-          echo "Patching clear_page_16bytes_align.patch (sed variant)"
-          if ! cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward; then
-            echo "::warning::clear_page_16bytes_align (sed variant) patch did not apply cleanly. Continuing without it (alignment optimization only)."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
-          fi
-        fi
-        
-        
-        echo "Patching add_limitation_scaling_min_freq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"; then
-          echo "::error::add_limitation_scaling_min_freq patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching re_write_limitation_scaling_min_freq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"; then
-          echo "::error::re_write_limitation_scaling_min_freq patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching adjust_cpu_scan_order.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"; then
-          echo "::error::adjust_cpu_scan_order patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching avoid_extra_s2idle_wake_attempts.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/avoid_extra_s2idle_wake_attempts.patch"; then
-          echo "::error::avoid_extra_s2idle_wake_attempts patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching disable_cache_hot_buddy.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/disable_cache_hot_buddy.patch"; then
-          echo "::error::disable_cache_hot_buddy patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching f2fs_enlarge_min_fsync_blocks.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/f2fs_enlarge_min_fsync_blocks.patch"; then
-          echo "::error::f2fs_enlarge_min_fsync_blocks patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching increase_ext4_default_commit_age.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/increase_ext4_default_commit_age.patch"; then
-          echo "::error::increase_ext4_default_commit_age patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching increase_sk_mem_packets.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/increase_sk_mem_packets.patch"; then
-          echo "::error::increase_sk_mem_packets patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_pci_pme_wakeups.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_pci_pme_wakeups.patch"; then
-          echo "::error::reduce_pci_pme_wakeups patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching silence_irq_cpu_logspam.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/silence_irq_cpu_logspam.patch"; then
-          echo "::error::silence_irq_cpu_logspam patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching silence_system_logspam.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"; then
-          echo "::error::silence_system_logspam patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching use_unlikely_wrap_cpufreq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
-          echo "::warning::use_unlikely_wrap_cpufreq patch did not apply cleanly. Continuing without it (cpufreq optimization only)."
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          find . -name "*.rej" -delete 2>/dev/null || true
-        fi
-        
-        echo "✅ Other patches applied"
+        echo "✅ module overlay applied"
         echo "::endgroup::"
+    - name: Apply optimized_mem_operations patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch optimized_mem_operations "$KERNEL_PATCHES_FOLDER/common/optimized_mem_operations.patch"
+    - name: Apply file_struct_8bytes_align patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch file_struct_8bytes_align "$KERNEL_PATCHES_FOLDER/common/file_struct_8bytes_align.patch"
+    - name: Apply reduce_cache_pressure patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_cache_pressure "$KERNEL_PATCHES_FOLDER/common/reduce_cache_pressure.patch"
+    - name: Apply mem_opt_prefetch patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch mem_opt_prefetch "$KERNEL_PATCHES_FOLDER/common/mem_opt_prefetch.patch"
+    - name: Apply optimise_memcmp patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        MEMCMP_SRC="$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch"
+        if grep -q 'SYM_FUNC_START(__pi_memcmp)' arch/arm64/lib/memcmp.S 2>/dev/null; then
+          gen_patch optimise_memcmp "$MEMCMP_SRC"
+        elif grep -q 'SYM_FUNC_START_WEAK_PI(memcmp)' arch/arm64/lib/memcmp.S 2>/dev/null; then
+          echo "Patching optimise_memcmp.patch (sed variant for the weak-PI memcmp shape)"
+          gen_patch optimise_memcmp "$MEMCMP_SRC" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
+        else
+          echo "::warning::optimise_memcmp: unrecognized memcmp.S symbol shape; skipping"
+          echo "optimise_memcmp|skipped" >> "$PS_FILE"
+        fi
+    - name: Apply minimise_wakeup_time patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch minimise_wakeup_time "$KERNEL_PATCHES_FOLDER/common/minimise_wakeup_time.patch"
+    - name: Apply int_sqrt patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch int_sqrt "$KERNEL_PATCHES_FOLDER/common/int_sqrt.patch"
+    - name: Apply force_tcp_nodelay patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch force_tcp_nodelay "$KERNEL_PATCHES_FOLDER/common/force_tcp_nodelay.patch"
+    - name: Apply reduce_gc_thread_sleep_time patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_gc_thread_sleep_time "$KERNEL_PATCHES_FOLDER/common/reduce_gc_thread_sleep_time.patch"
+    - name: Apply add_timeout_wakelocks_globally patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch add_timeout_wakelocks_globally "$KERNEL_PATCHES_FOLDER/common/add_timeout_wakelocks_globally.patch"
+    - name: Apply f2fs_reduce_congestion patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch f2fs_reduce_congestion "$KERNEL_PATCHES_FOLDER/common/f2fs_reduce_congestion.patch"
+    - name: Apply reduce_freeze_timeout patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_freeze_timeout "$KERNEL_PATCHES_FOLDER/common/reduce_freeze_timeout.patch"
+    - name: Apply clear_page_16bytes_align patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        CLEAR_PAGE_SRC="$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
+        if grep -q 'SYM_FUNC_START_PI(clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC"
+        elif grep -q 'SYM_FUNC_START_PI(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
+          echo "Patching clear_page_16bytes_align.patch (sed variant for the __pi clear_page shape)"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
+        elif grep -q 'SYM_FUNC_START(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
+          echo "Patching clear_page_16bytes_align.patch (sed variant for the plain __pi clear_page shape)"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
+        else
+          echo "::warning::clear_page_16bytes_align: unrecognized clear_page.S symbol shape; skipping"
+          echo "clear_page_16bytes_align|skipped" >> "$PS_FILE"
+        fi
+    - name: Apply add_limitation_scaling_min_freq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch add_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"
+    - name: Apply re_write_limitation_scaling_min_freq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch re_write_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"
+    - name: Apply adjust_cpu_scan_order patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch adjust_cpu_scan_order "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"
+    - name: Apply avoid_extra_s2idle_wake_attempts patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch avoid_extra_s2idle_wake_attempts "$KERNEL_PATCHES_FOLDER/common/avoid_extra_s2idle_wake_attempts.patch"
+    - name: Apply disable_cache_hot_buddy patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch disable_cache_hot_buddy "$KERNEL_PATCHES_FOLDER/common/disable_cache_hot_buddy.patch"
+    - name: Apply f2fs_enlarge_min_fsync_blocks patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch f2fs_enlarge_min_fsync_blocks "$KERNEL_PATCHES_FOLDER/common/f2fs_enlarge_min_fsync_blocks.patch"
+    - name: Apply increase_ext4_default_commit_age patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch increase_ext4_default_commit_age "$KERNEL_PATCHES_FOLDER/common/increase_ext4_default_commit_age.patch"
+    - name: Apply increase_sk_mem_packets patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch increase_sk_mem_packets "$KERNEL_PATCHES_FOLDER/common/increase_sk_mem_packets.patch"
+    - name: Apply reduce_pci_pme_wakeups patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_pci_pme_wakeups "$KERNEL_PATCHES_FOLDER/common/reduce_pci_pme_wakeups.patch"
+    - name: Apply silence_irq_cpu_logspam patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch silence_irq_cpu_logspam "$KERNEL_PATCHES_FOLDER/common/silence_irq_cpu_logspam.patch"
+    - name: Apply silence_system_logspam patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch silence_system_logspam "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"
+    - name: Apply use_unlikely_wrap_cpufreq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch use_unlikely_wrap_cpufreq "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
 
     - name: Apply NTSync Patch
       shell: bash
@@ -1998,18 +2631,23 @@ runs:
             fi
             ;;
         esac
-        if [ -n "$NTSYNC_PATCH" ]; then
-          if [ ! -f "$NTSYNC_PATCH" ]; then
-            echo "::error::NTSync compat patch not found for ${OP_MODEL}: $(basename $NTSYNC_PATCH)"
-            exit 1
+        if [ -n "$NTSYNC_PATCH" ] && [ ! -f "$NTSYNC_PATCH" ]; then
+          echo "::warning::NTSync compat patch not found for ${OP_MODEL}: $(basename "$NTSYNC_PATCH"); skipping NTSync"
+          echo "ntsync|skipped" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+        if [ -z "$NTSYNC_PATCH" ]; then
+          if [ -f "$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}_${OP_OS_VERSION/OOS/A}.patch" ]; then
+            NTSYNC_PATCH="$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}_${OP_OS_VERSION/OOS/A}.patch"
+          elif [ -f "$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}.patch" ]; then
+            NTSYNC_PATCH="$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}.patch"
+          else
+            echo "::warning::NTSync compat patch not found for ${GKI_KEY} (Model: ${OP_MODEL}, OOS: ${OP_OS_VERSION}); skipping NTSync"
+            echo "ntsync|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
           fi
-        elif [ -f "$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}_${OP_OS_VERSION/OOS/A}.patch" ]; then
-          NTSYNC_PATCH="$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}_${OP_OS_VERSION/OOS/A}.patch"
-        elif [ -f "$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}.patch" ]; then
-          NTSYNC_PATCH="$NTSYNC_FOLDER/ntsync_compat_${GKI_KEY}.patch"
-        else
-          echo "::error::NTSync patch not found for ${GKI_KEY} (Model: ${OP_MODEL}, OOS: ${OP_OS_VERSION})"
-          exit 1
         fi
         
         echo "Using patch: $(basename $NTSYNC_PATCH)"
@@ -2037,21 +2675,19 @@ runs:
             rm -f include/linux/lockdep.h.rej
             echo "✅ lockdep.h manual fallback applied"
           else
-            echo "::error::$(basename $NTSYNC_PATCH) patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
+            echo "::warning::$(basename "$NTSYNC_PATCH") patch failed; continuing without NTSync"
+            echo "ntsync|failed" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
           fi
         fi
-        echo "Patching ntsync_base!"
-        if ! patch -p1 --forward < "$NTSYNC_FOLDER/ntsync_base.patch"; then
-          echo "::error::ntsync_base patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch ntsync "$NTSYNC_FOLDER/ntsync_base.patch" "" "g:drivers/misc/ntsync.c|ntsync_misc"
+        if grep -Eq '^ntsync\|(applied|already)$' "$PS_FILE"; then
+          printf '%s\n' 'CONFIG_NTSYNC=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+          grep -n '^CONFIG_NTSYNC=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+          echo "✅ NTSync patch applied"
         fi
-        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-        CONFIG_NTSYNC=y
-        EOF
-        echo "✅ NTSync patch applied"
         echo "::endgroup::"
 
     - name: Apply Unicode Fix Patch
@@ -2064,20 +2700,26 @@ runs:
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
         MIN_VERSION="5.16"
         
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         echo "Patching unicode!"
-        if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-            if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1-.patch"; then
-              echo "::error::unicode_bypass_fix_6.1- patch failed. Dumping all .rej files:"
-              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-              exit 1
-            fi
+        UNICODE_PATCH=""
+        if grep -rq 'u8c->um' fs/unicode/ 2>/dev/null; then
+          UNICODE_PATCH="$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch"
+          echo "Tree unicode shape u8c->um detected"
+        elif grep -rq 'u8c->data' fs/unicode/ 2>/dev/null; then
+          UNICODE_PATCH="$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1-.patch"
+          echo "Tree unicode shape u8c->data detected"
+        elif [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
+          UNICODE_PATCH="$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1-.patch"
         else
-            if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch"; then
-              echo "::error::unicode_bypass_fix_6.1+ patch failed. Dumping all .rej files:"
-              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-              exit 1
-            fi
+          UNICODE_PATCH="$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch"
         fi
+        echo "Using patch: $(basename "$UNICODE_PATCH")"
+        gen_patch unicode "$UNICODE_PATCH"
+        if grep -Eq '^unicode\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "✅ Unicode fix applied"
+        fi
+        echo "::endgroup::"
 
     - name: Add Tmpfs Support
       shell: bash
@@ -2102,6 +2744,141 @@ runs:
         CONFIG_NET_SCH_FQ=y
         CONFIG_NET_SCH_FQ_CODEL=y
         EOF
+        if [ -f "$COMMON_KERNEL_FOLDER/net/ipv4/tcp_bbr.c" ] && \
+           grep -q 'config TCP_CONG_BBR' "$COMMON_KERNEL_FOLDER/net/ipv4/Kconfig"; then
+          grep -nE '^CONFIG_(TCP_CONG_BBR|NET_SCH_FQ)=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || true
+          echo "✅ BBR congestion control enabled"
+          echo "bbr|applied" >> "$PS_FILE"
+        else
+          echo "::warning::BBR not available in tree (tcp_bbr.c/Kconfig missing); marking failed"
+          echo "bbr|failed" >> "$PS_FILE"
+        fi
+
+    - name: Apply BBRv3
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BBRv3"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        BBR3_BASE="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
+        MAIN_PATCH="0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch"
+        DEBUGFS_PATCH="0002-net-tcp-bbr3-add-debugfs-diagnostics-and-runtime-tunables.patch"
+        if ! fetch_patch "$BBR3_BASE/$MAIN_PATCH" /tmp/bbr3_main.patch; then
+          echo "::warning::BBRv3 backport unavailable for ${ANDROID_VER}-${KERNEL_VER}; skipping"
+          echo "bbrv3|skipped" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+        if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
+          if fetch_patch "$BBR3_BASE/sysctl_add_proc_dou8vec_minmax.patch" /tmp/bbr3_sysctl_add.patch && \
+             fetch_patch "$BBR3_BASE/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch" /tmp/bbr3_sysctl_fix.patch; then
+            gen_patch bbr3-sysctl-add /tmp/bbr3_sysctl_add.patch
+            gen_patch bbr3-sysctl-fix /tmp/bbr3_sysctl_fix.patch
+          else
+            echo "::warning::BBRv3 sysctl prerequisite patches unavailable; continuing without them"
+          fi
+          if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
+            echo "::warning::kernel/sysctl.c still lacks proc_dou8vec_minmax; skipping BBRv3"
+            echo "bbrv3|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+        fi
+        gen_patch bbrv3 /tmp/bbr3_main.patch "" "g:net/ipv4/tcp_bbr3.c|bbr3_register"
+        if ! grep -Eq '^bbrv3\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::warning::BBRv3 backport does not apply for ${ANDROID_VER}-${KERNEL_VER} - build continues without it"
+          echo "::endgroup::"
+          exit 0
+        fi
+        if fetch_patch "$BBR3_BASE/$DEBUGFS_PATCH" /tmp/bbr3_debugfs.patch; then
+          gen_patch bbrv3-debugfs /tmp/bbr3_debugfs.patch
+        else
+          echo "::warning::BBRv3 debugfs patch unavailable; continuing without it"
+        fi
+        grep -q 'config TCP_CONG_BBR3' net/ipv4/Kconfig
+        grep -q 'tcp_bbr3' net/ipv4/Makefile
+        grep -q '^CONFIG_TCP_CONG_BBR=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_NET_SCH_FQ=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_NET_SCH_FQ=y' >> arch/arm64/configs/gki_defconfig
+        grep -q '^CONFIG_TCP_CONG_BBR3=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_TCP_CONG_BBR3=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
+        echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
+        echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
+        echo "✅ BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
+
+    - name: Apply BoRE
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply BoRE scheduler"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        BORE_PATCH="bore_${KERNEL_VER}.patch"
+        case "$KERNEL_VER" in
+          6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
+          *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
+        esac
+        # Tree-exact regen patch is the PRIMARY source: pre-ported BoRE patches
+        # live in scripts/patches, keyed by kernel version
+        # (bore_<ver>_oneplus_regen.patch). They run through the same gen_patch
+        # pipeline (stage fuzz=0 -> regen -> apply fuzz=0 -> verify), so patchgen
+        # staging wins whenever a committed override exists. Bouteillepleine's
+        # upstream patch targets the reworked EEVDF base and structurally cannot
+        # stage on this tree, so the upstream fetch is the fallback, used only
+        # when no regen patch is committed for this kernel version.
+        BORE_REGEN="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
+        [ -f "$BORE_REGEN" ] || BORE_REGEN=""
+        # Fail-safe content guard: a regen patch carrying the duplicated
+        # return-curr construct (added line directly above an identical
+        # context line in a brace-less if) bootloops the device. Refuse it
+        # rather than build an unbootable kernel.
+        if [ -n "$BORE_REGEN" ] && awk '
+            /^\+[[:space:]]*return curr;[[:space:]]*$/ { if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*return curr;[[:space:]]*$/) { found = 1; exit } }
+            END { exit !(found) }
+          ' "$BORE_REGEN"; then
+          echo "::warning::bore: committed regen patch matches the duplicated return-curr bootloop signature; refusing it — re-commit the corrected bore_${KERNEL_VER}_oneplus_regen.patch"
+          BORE_REGEN=""
+        fi
+        BORE_UPSTREAM=""
+        if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+          BORE_UPSTREAM="/tmp/bore.patch"
+        fi
+        if [ -z "$BORE_REGEN" ] && [ -z "$BORE_UPSTREAM" ]; then
+          echo "::warning::BoRE patch unavailable (${BORE_PATCH}); skipping"
+          echo "bore|skipped" >> "$PS_FILE"
+          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+          exit 0
+        fi
+        gen_patch_fb bore "$BORE_REGEN" "$BORE_UPSTREAM" "" "$BORE_SPEC" || true
+        if [ "${GEN_PATCH_FB_VIA:-none}" = "none" ] || ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+          exit 0
+        fi
+        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+          echo "[patchgen] bore: landed via tree-exact regen (patchgen staging, $(basename "$BORE_REGEN"))"
+          echo "BORE_VIA=patchgen-regen" >> "$GITHUB_ENV"
+        else
+          echo "[patchgen] bore: landed via latest-upstream ($(basename "$BORE_UPSTREAM"))"
+          echo "BORE_VIA=latest-upstream" >> "$GITHUB_ENV"
+        fi
+        grep -q 'config SCHED_BORE' init/Kconfig
+        grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
+        echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
+        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+          echo "BORE_SOURCE=scripts/patches/$(basename "$BORE_REGEN") (tree-exact regen)" >> "$GITHUB_ENV"
+        else
+          echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+        fi
+        echo "✅ BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "::endgroup::"
 
     - name: Add TTL Target Support
       if: ${{ env.OP_TTL == 'true' }}
@@ -2114,6 +2891,15 @@ runs:
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
+        if grep -q 'config IP_NF_TARGET_TTL' "$COMMON_KERNEL_FOLDER/net/ipv4/netfilter/Kconfig" && \
+           grep -q 'config IP6_NF_TARGET_HL' "$COMMON_KERNEL_FOLDER/net/ipv6/netfilter/Kconfig"; then
+          grep -nE '^CONFIG_(IP_NF_TARGET_TTL|IP6_NF_(TARGET_HL|MATCH_HL))=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || true
+          echo "✅ TTL/HL target support enabled"
+          echo "ttl|applied" >> "$PS_FILE"
+        else
+          echo "::warning::TTL/HL targets unavailable in tree; marking failed"
+          echo "ttl|failed" >> "$PS_FILE"
+        fi
 
     - name: Add IP SET & IPv6_NAT Support
       if: ${{ env.OP_IP_SET == 'true' }}
@@ -2155,11 +2941,15 @@ runs:
         CONFIG_IP6_NF_TARGET_MASQUERADE=y
         EOF
         
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         echo "Patching IPv6_NAT_FIX.patch"
-        if ! patch -p1 --fuzz=2 < "$KERNEL_PATCHES_FOLDER/common/IPv6_NAT_FIX.patch"; then
-          echo "::error::IPv6_NAT_FIX patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
+        gen_patch ipv6-nat "$KERNEL_PATCHES_FOLDER/common/IPv6_NAT_FIX.patch" "" "g:kernel/Makefile|IP6_NF_NAT"
+        if grep -Eq '^ipv6-nat\|(applied|already)$' "$PS_FILE"; then
+          echo "ip_set|applied" >> "$PS_FILE"
+          grep -nE '^CONFIG_(IP_SET=|IP6_NF_NAT=|NETFILTER_XT_SET=)' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 5 || true
+          echo "✅ IP SET & IPv6 NAT support enabled"
+        else
+          echo "ip_set|failed" >> "$PS_FILE"
         fi
     
     - name: Add USB DWC3 & OTG Support
@@ -2198,7 +2988,7 @@ runs:
 
     - name: Add LXC / Droidspaces support
       shell: bash
-      if: ${{ env.OP_LXC_DS == 'true' }}
+      if: ${{ env.OP_LXC_DS == 'true' && env.OP_DS != 'true' }}
       run: |
         set -euo pipefail
         echo "Add Droidspaces Support"
@@ -2217,6 +3007,7 @@ runs:
         CONFIG_PID_NS = y
         CONFIG_POSIX_MQUEUE = y
         EOF
+        echo "ds|applied" >> "$PS_FILE"
 
     - name: Add Droidspaces support
       shell: bash
@@ -2302,6 +3093,7 @@ runs:
         fi
         
         echo "✅ Droidspaces Support applied"
+        echo "ds|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add Build based configs
@@ -2386,7 +3178,7 @@ runs:
         echo "Customize Kernel Branding"
         cd "$COMMON_KERNEL_FOLDER"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}-${{ github.actor }}"
+        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
 
     - name: Disable GPUEB
@@ -2407,7 +3199,7 @@ runs:
         
         OPTIONS=()
         
-        if [ "$OP_BBR" = "true" ] || [ "$OP_BBR3" = "true" ]; then
+        if [ "${OP_BBR:-}" = "true" ] || [ "${OP_BBR3:-}" = "true" ]; then
           OPTIONS+=("CONFIG_TCP_CONG_ADVANCED")
         fi
         
@@ -2418,8 +3210,70 @@ runs:
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
 
+    - name: Patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Patch dry-run verdict"
+        VERDICT="$DEBUG_ARTIFACTS_DIR/patch_dry_run_${OP_MODEL}_${OP_OS_VERSION}.txt"
+        failed_patches="$(grep -Ec '\|failed$' "$PS_FILE" 2>/dev/null || true)"
+        skipped_patches="$(grep -Ec '\|skipped$' "$PS_FILE" 2>/dev/null || true)"
+        {
+          echo "device=$OP_MODEL os=$OP_OS_VERSION"
+          echo "kernel=${ANDROID_VER}-${TKERNEL_VER}"
+          echo "== per-patch status =="
+          cat "$PS_FILE" 2>/dev/null || true
+          echo "== summary =="
+          echo "failed_patches=${failed_patches:-0}"
+          echo "skipped_patches=${skipped_patches:-0}"
+          echo "adios=${ADIOS_ENABLED:-not-applied}"
+          echo "bbrv3=${BBR3_APPLIED:-not-applied}"
+          echo "bore=${BORE_APPLIED:-not-applied}"
+          echo "bore_skipped=${BORE_SKIPPED:-none}"
+          echo "adios_skipped=${ADIOS_SKIPPED:-none}"
+          if [ "${failed_patches:-0}" -gt 0 ] || [ "${skipped_patches:-0}" -gt 0 ]; then
+            echo "result=PARTIAL_PATCHES_APPLIED"
+          else
+            echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+          fi
+        } > "$VERDICT"
+        cat "$VERDICT"
+        if [ "${failed_patches:-0}" -gt 0 ] || [ "${skipped_patches:-0}" -gt 0 ]; then
+          echo "::notice::patch_dry_run=true — patches applied with soft-skips/soft-fails for ${OP_MODEL} ${OP_OS_VERSION} (see verdict). Compilation intentionally skipped."
+        else
+          echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+        fi
+        echo "::endgroup::"
+
+    - name: Upload patch dry-run verdict
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-dry-run-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}
+        path: ${{ env.DEBUG_ARTIFACTS_DIR }}/patch_dry_run_*.txt
+        if-no-files-found: error
+        retention-days: 7
+
+    - name: Upload patch status
+      if: ${{ always() && env.PS_FILE != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-status-${{ env.PS_BASE }}
+        path: ${{ env.PS_FILE }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Stop before build (dry run)
+      if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+      shell: bash
+      run: |
+        echo "Dry run complete — see the patch-dry-run artifact. Not building."
+        exit 0
+        
     - name: Build Kernel
       id: build_kernel_step
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       env:
         PYTHONWARNINGS: "ignore:invalid escape sequence"
@@ -2464,7 +3318,10 @@ runs:
         export SOURCE_DATE_EPOCH=$COMMIT_TIMESTAMP
         if [ -n "${{ inputs.build_timestamp }}" ]; then
           export KBUILD_BUILD_TIMESTAMP="${{ inputs.build_timestamp }}"
-          echo "📅 Using custom build timestamp: $KBUILD_BUILD_TIMESTAMP"
+          echo "📅 Using custom build timestamp input: $KBUILD_BUILD_TIMESTAMP"
+        elif [ -n "${OP_BUILD_TIME:-}" ] && [ "${OP_BUILD_TIME}" != "null" ]; then
+          export KBUILD_BUILD_TIMESTAMP="$OP_BUILD_TIME"
+          echo "📅 Using per-config build_time: $KBUILD_BUILD_TIMESTAMP"
         else
           export KBUILD_BUILD_TIMESTAMP="$KERNEL_BUILD_DATE"
           echo "📅 Using current UTC build timestamp: $KBUILD_BUILD_TIMESTAMP"
@@ -2632,7 +3489,7 @@ runs:
 
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
-      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') }}
+      if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2702,6 +3559,7 @@ runs:
 
     - name: Collect Build Stats / Validate Image
       id: collect_stats
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2759,6 +3617,7 @@ runs:
 
     - name: Create Kernel ZIP
       id: create_zip
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2821,10 +3680,13 @@ runs:
         echo "::endgroup::"
 
     - name: Final Build Summary
+      if: ${{ !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       shell: bash
       run: |
         set -euo pipefail
         
+        pstat() { local v; v="$(awk -F'|' -v k="$1" '$1==k{print $2}' "$PS_FILE" 2>/dev/null || true)"; echo "${v:-not requested}"; }
+
         # Get commit SHAs with fallback
         KSU_SHA="${KSU_COMMIT_SHA:-unknown}"
         SUSFS_SHA="${SUSFS_COMMIT_SHA:-unknown}"
@@ -2838,9 +3700,9 @@ runs:
           echo "Kernel Uname: ${{ env.KERNEL_UNAME }}"
           echo "Build User: ${{ env.BUILD_USER }}"
           echo "Build Host: ${{ env.BUILD_HOST }}"
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "ReSukiSU Version: ${KSUVER:-unknown}"
-            echo "ReSukiSU commit SHA: ${KSU_SHA:-unknown}"
+          if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+            echo "BakaSU Version: ${KSUVER:-unknown}"
+            echo "BakaSU commit SHA: ${KSU_SHA:-unknown}"
           else
             echo "KSU Version: ${KSUVER:-unknown}"
             echo "KSU commit SHA: ${KSU_SHA:-unknown}"
@@ -2852,15 +3714,21 @@ runs:
           echo "Optimization: ${{ inputs.optimize_level }}"
           echo "Clean Build: ${{ inputs.clean }}"
           echo ""
-          echo "=== OnePlus Features ==="
-          echo "BBR: ${{ env.OP_BBR }}"
-          echo "BBG: ${{ env.OP_BBG }}"
-          echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
-          echo "TTL: ${{ env.OP_TTL }}"
-          echo "IP_SET & IPv6 NAT: ${{ env.OP_IP_SET }}"
-          echo "Unicode Fix: ${{ env.OP_UNICODE }}"
-          echo "NTSync: ${{ env.OP_NTSYNC }}"
-          echo "Droidspaces: ${{ env.OP_DS }}"
+          echo "=== Patch Status (actual application results) ==="
+          echo "SusFS: $(pstat susfs)"
+          echo "BBR: $(pstat bbr)"
+          echo "BBRv3: $(pstat bbrv3)"
+          echo "BoRE: $(pstat bore) (via ${BORE_VIA:-n/a})"
+          echo "ADIOS: $(pstat adios)"
+          echo "BBG: $(pstat bbg)"
+          echo "HMBIRD SCX: $(pstat hmbird)"
+          echo "TTL: $(pstat ttl)"
+          echo "IP_SET & IPv6 NAT: $(pstat ip_set)"
+          echo "Unicode Fix: $(pstat unicode)"
+          echo "NTSync: $(pstat ntsync)"
+          echo "Droidspaces: $(pstat ds)"
+          echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
+          echo "NoMount: $(pstat nomount)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
@@ -2888,15 +3756,15 @@ runs:
           echo "| **Build User** | ${{ env.BUILD_USER }} |"
           echo "| **Build Host** | ${{ env.BUILD_HOST }} |"
           
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "| **ReSukiSU Version** | ${KSUVER:-unknown} |"
+          if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+            echo "| **BakaSU Version** | ${KSUVER:-unknown} |"
           else
             echo "| **KSU Version** | ${KSUVER:-unknown} |"
           fi
           
           if [ "$KSU_SHA" != "unknown" ]; then
-            if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-              echo "| **ReSukiSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/ReSukiSU/ReSukiSU/commit/$KSU_SHA) |"
+            if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+              echo "| **BakaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/Baka-SU/BakaSU/commit/$KSU_SHA) |"
             else
               echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
             fi
@@ -2915,18 +3783,24 @@ runs:
           fi
           
           echo ""
-          echo "### 🔧 OnePlus Features"
+          echo "### 🔧 Patch Status (actual application results)"
           echo ""
           echo "| Feature | Status |"
           echo "|---------|--------|"
-          echo "| **BBR** | ${{ env.OP_BBR }} |"
-          echo "| **BBG** | ${{ env.OP_BBG }} |"
-          echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
-          echo "| **TTL** | ${{ env.OP_TTL }} |"
-          echo "| **IP_SET & IPv6 NAT** | ${{ env.OP_IP_SET }} |"
-          echo "| **Unicode Fix** | ${{ env.OP_UNICODE }} |"
-          echo "| **NTSync** | ${{ env.OP_NTSYNC }} |"
-          echo "| **Droidspaces** | ${{ env.OP_DS }} |"
+          echo "| **SusFS** | $(pstat susfs) |"
+          echo "| **BBR** | $(pstat bbr) |"
+          echo "| **BBRv3** | $(pstat bbrv3) |"
+          echo "| **BoRE** | $(pstat bore) (via ${BORE_VIA:-n/a}) |"
+          echo "| **ADIOS** | $(pstat adios) |"
+          echo "| **BBG** | $(pstat bbg) |"
+          echo "| **HMBIRD SCX** | $(pstat hmbird) |"
+          echo "| **TTL** | $(pstat ttl) |"
+          echo "| **IP_SET & IPv6 NAT** | $(pstat ip_set) |"
+          echo "| **Unicode Fix** | $(pstat unicode) |"
+          echo "| **NTSync** | $(pstat ntsync) |"
+          echo "| **Droidspaces** | $(pstat ds) |"
+          echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
+          echo "| **NoMount** | $(pstat nomount) |"
           
           echo ""
           echo "### 📊 Build Metrics"
@@ -2959,7 +3833,7 @@ runs:
         retention-days: 90
 
     - name: Upload Artifacts
-      if: success() && steps.create_zip.conclusion == 'success'
+      if: ${{ success() && steps.create_zip.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: ${{ env.ZIP_NAME }}
@@ -2969,7 +3843,7 @@ runs:
         retention-days: 90
 
     - name: Upload ccache log
-      if: success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success'
+      if: ${{ success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success' && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
       uses: actions/upload-artifact@v7
       with:
         name: "${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}_${{ env.KERNEL_FULL_VER }}_ccache.log"

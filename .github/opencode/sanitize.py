@@ -43,7 +43,7 @@ def sanitize():
     # 2. Update config JSONs: uname + os_version
     json_files = glob.glob("configs/**/*.json", recursive=True)
     for json_file in json_files:
-        run_command(f"sed -i 's/\"uname\": \"OP-WILD\"/\"uname\": \"OP-RESUKISU\"/g' {json_file}")
+        run_command(f"sed -i 's/\"uname\": \"OP-WILD\"/\"uname\": \"OP-BAKASU\"/g' {json_file}")
         # Revert upstream's OOS1x -> A1x rename in os_version; the fork's
         # build-kernel-release.yml needs "OOS14"/"OOS15"/"OOS16".
         run_command(f"sed -i 's/\"os_version\": \"A14\"/\"os_version\": \"OOS14\"/g' {json_file}")

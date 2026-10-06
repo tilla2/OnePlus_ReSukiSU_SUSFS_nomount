@@ -883,7 +883,6 @@ diff -ruN a/kernel/sched/fair.c b/kernel/sched/fair.c
 +		if (!(likely(sched_bore) && likely(sched_burst_parity_threshold) &&
 +			sched_burst_parity_threshold < cfs_rq->nr_running))
 +#endif // CONFIG_SCHED_BORE
-+		return curr;
  		return curr;
  
  	/* Pick the leftmost entity if it's eligible */

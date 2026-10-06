@@ -997,7 +997,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload patch failure forensics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: patch-faillogs-${{ matrix.model }}

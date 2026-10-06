@@ -2013,7 +2013,7 @@ runs:
             exit 0
           fi
           gen_patch adios /tmp/adios.patch "" "g:block/adios.c|adios_init_sched"
-          if [ "$(grep -xEc 'adios\|(applied\|already)' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+          if ! grep -Eq '^adios\|(applied|already)' "$PS_FILE" 2>/dev/null; then
             echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
             echo "::endgroup::"
             exit 0
@@ -2601,7 +2601,7 @@ runs:
           fi
         fi
         gen_patch bbrv3 /tmp/bbr3_main.patch "" "g:net/ipv4/tcp_bbr3.c|bbr3_register"
-        if [ "$(grep -xEc 'bbrv3\|(applied\|already)' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+        if ! grep -Eq '^bbrv3\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::warning::BBRv3 backport does not apply for ${ANDROID_VER}-${KERNEL_VER} - build continues without it"
           echo "::endgroup::"
           exit 0
@@ -2645,7 +2645,7 @@ runs:
           *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
         esac
         gen_patch bore /tmp/bore.patch "" "$BORE_SPEC"
-        if [ "$(grep -xEc 'bore\|(applied\|already)' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+        if ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0

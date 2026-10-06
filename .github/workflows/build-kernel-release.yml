@@ -4,6 +4,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -1413,7 +1417,7 @@ jobs:
             fi
             if [[ -f "$status_file" ]]; then
               while IFS='|' read -r patch_key patch_status; do
-                [[ "$patch_status" == "applied" ]] || continue
+                [[ "$patch_status" == "applied" || "$patch_status" == "already" ]] || continue
                 case "$patch_key" in
                   hmbird) features+=("🐦 HMBIRD") ;;
                   susfs) features+=("ඞ SusFS") ;;

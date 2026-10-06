@@ -1,0 +1,288 @@
+name: Patch Hygiene Check
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      op_model:
+        description: 'Select the OnePlus kernels to check'
+        required: true
+        type: choice
+        options:
+          - OOS14+15+16
+          - OOS15+16
+          - OOS14+15
+          - OOS16
+          - OOS15
+          - OOS14
+        default: OOS16
+      config_path:
+        description: 'Optional exact config path for a single-device check (for example configs/oos16/OP15.json)'
+        required: false
+        type: string
+        default: ''
+      strict:
+        description: 'Fail the run when any checked patch does not apply cleanly'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: patch-hygiene-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build check matrix
+        id: matrix
+        env:
+          OP_MODEL: ${{ inputs.op_model }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, glob, os
+          op = os.environ["OP_MODEL"]
+          cfg = os.environ["CONFIG_PATH"].strip()
+          wanted = {
+              "OOS14+15+16": {"OOS14", "OOS15", "OOS16"},
+              "OOS15+16": {"OOS15", "OOS16"},
+              "OOS14+15": {"OOS14", "OOS15"},
+              "OOS16": {"OOS16"},
+              "OOS15": {"OOS15"},
+              "OOS14": {"OOS14"},
+          }[op]
+          entries = []
+          for path in sorted(glob.glob("configs/*/*.json")):
+              try:
+                  c = json.load(open(path))
+              except Exception:
+                  continue
+              if c.get("os_version") not in wanted:
+                  continue
+              if cfg and os.path.relpath(path) != cfg:
+                  continue
+              entries.append({
+                  "model": c.get("model", os.path.basename(path)[:-5]),
+                  "os_version": c.get("os_version", ""),
+                  "config": path,
+                  "manifest": c.get("manifest", ""),
+              })
+          if not entries:
+              raise SystemExit("no configs matched the selected scope")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": entries}) + "\n")
+          PY
+
+  hygiene:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve kernel tree and classify patches
+        env:
+          CONFIG: ${{ matrix.config }}
+          MANIFEST: ${{ matrix.manifest }}
+          MODEL: ${{ matrix.model }}
+          OSVER: ${{ matrix.os_version }}
+          STRICT: ${{ inputs.strict }}
+        run: |
+          set -euo pipefail
+          mkdir -p hygiene-out tree
+          AV="$(jq -r '.android_version' "$CONFIG")"
+          KV="$(jq -r '.kernel_version' "$CONFIG")"
+          echo "Device $MODEL ($OSVER) on $AV-$KV, manifest $MANIFEST"
+
+          MAPFROM=$(python3 - "$MANIFEST" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          t = ET.parse(sys.argv[1])
+          root = t.getroot()
+          remotes = {r.get("name"): r.get("fetch") for r in root.findall("remote")}
+          default_rev = root.find("default").get("revision") if root.find("default") is not None else ""
+          for p in root.findall("project"):
+              path = (p.get("path") or "").rstrip("/")
+              if path.endswith("common"):
+                  rev = p.get("revision") or default_rev
+                  fetch = remotes.get(p.get("remote"), "")
+                  name = p.get("name")
+                  print(fetch + "\t" + name + "\t" + rev)
+                  break
+          PY
+          )
+          if [ -z "$MAPFROM" ]; then
+            echo "::error::No common kernel project found in $MANIFEST"
+            exit 1
+          fi
+          KFETCH=$(sed -E 's#^([^\t]*)\t.*#\1#' <<<"$MAPFROM")
+          KNAME=$(sed -E 's#^[^\t]*\t([^\t]*)\t.*#\1#' <<<"$MAPFROM")
+          KREV=$(sed -E 's#^[^\t]*\t[^\t]*\t([^\t]*)#\1#' <<<"$MAPFROM")
+          if [[ "$KFETCH" == https://github.com/* ]]; then
+            RAWBASE="https://raw.githubusercontent.com/${KFETCH#https://github.com/}/${KNAME}/${KREV}"
+          else
+            RAWBASE="${KFETCH}/${KNAME}/-/raw/${KREV}"
+          fi
+          echo "Kernel tree base: $RAWBASE"
+
+          fetch_tree_file() {
+            local rel="$1" out="tree/$1"
+            mkdir -p "$(dirname "$out")"
+            curl -sSL --fail -o "$out" "$RAWBASE/$rel"
+          }
+
+          split_hunks() {
+            local patch_file="$1" out_dir="$2"
+            rm -rf "$out_dir" && mkdir -p "$out_dir"
+            awk -v out="$out_dir" '
+              BEGIN { inh = 0; nh = 0; orem = 0; nrem = 0; sawd = 0; sawp = 0; hdr = "" }
+              !inh && /^diff |^Index: / { hdr = $0 "\n"; sawd = 0; sawp = 0; next }
+              !inh && /^--- / && !sawd { hdr = hdr $0 "\n"; sawd = 1; next }
+              !inh && /^\+\+\+ / && sawd && !sawp { hdr = hdr $0 "\n"; sawp = 1; next }
+              !inh && /^--- / && sawd && sawp { hdr = $0 "\n"; sawd = 1; sawp = 0; next }
+              !inh && /^@@ / {
+                split($0, a, " ")
+                split(a[2], o, ","); split(a[3], n, ",")
+                orem = (length(o[2]) ? o[2]+0 : 1); nrem = (length(n[2]) ? n[2]+0 : 1)
+                if (sawp) {
+                  nh++; hf = sprintf("%s/h%03d.hunk", out, nh)
+                  printf "%s", hdr > hf; print $0 >> hf; inh = 1
+                }
+                next
+              }
+              inh {
+                print $0 >> hf
+                if ($0 ~ /^\\/) next
+                c = substr($0, 1, 1)
+                if (c == "-") orem--
+                else if (c == "+") nrem--
+                else { orem--; nrem-- }
+                if (orem <= 0 && nrem <= 0) { close(hf); inh = 0 }
+                next
+              }
+            ' "$patch_file"
+          }
+
+          classify() {
+            local name="$1" patch="$2"
+            local hd="/tmp/hyg_hunks_${name}" h hlist staged=0 already_ct=0 failed_ct=0
+            split_hunks "$patch" "$hd"
+            hlist=$(ls "$hd"/*.hunk 2>/dev/null || true)
+            if [ -z "$hlist" ]; then
+              if patch --dry-run -p1 --fuzz=0 -d tree < "$patch" >/dev/null 2>&1; then
+                echo "applies"
+              elif patch --dry-run -p1 -R --fuzz=0 -d tree < "$patch" >/dev/null 2>&1; then
+                echo "already"
+              else
+                echo "fails"
+              fi
+              rm -rf "$hd"
+              return 0
+            fi
+            for h in $hlist; do
+              if patch --dry-run -p1 --fuzz=0 -d tree < "$h" >/dev/null 2>&1; then
+                staged=$((staged+1))
+              elif patch --dry-run -p1 -R --fuzz=0 -d tree < "$h" >/dev/null 2>&1; then
+                already_ct=$((already_ct+1))
+              else
+                failed_ct=$((failed_ct+1))
+              fi
+            done
+            rm -rf "$hd"
+            if [ "$staged" -gt 0 ]; then
+              echo "applies"
+            elif [ "$already_ct" -gt 0 ]; then
+              echo "already"
+            else
+              echo "fails"
+            fi
+          }
+
+          STATUS_FILE="hygiene-out/${MODEL}_${OSVER}.txt"
+          : > "$STATUS_FILE"
+
+          check_entry() {
+            local entry="$1"
+            local name url flag sedexpr
+            IFS='|' read -r name url flag sedexpr <<< "$entry"
+            url="${url//\$\{AV\}/$AV}"
+            url="${url//\$\{KV\}/$KV}"
+            local enabled
+            enabled="$(jq -r --arg k "$flag" '.[$k]' "$CONFIG")"
+            if [ "$enabled" != "true" ]; then
+              return 0
+            fi
+            local work="/tmp/hyg_${name}"
+            rm -rf "$work" && mkdir -p "$work"
+            if ! curl -sSL --fail -o "$work/src.patch" "$url"; then
+              echo "${name}|unavailable" >> "$STATUS_FILE"
+              return 0
+            fi
+            if [ -n "$sedexpr" ]; then
+              sed -e "$sedexpr" "$work/src.patch" > "$work/patch.patch"
+            else
+              cp "$work/src.patch" "$work/patch.patch"
+            fi
+            local missing=0
+            while IFS= read -r f; do
+              [ "$f" = "/dev/null" ] && continue
+              if ! fetch_tree_file "$f"; then
+                echo "::warning::${name}: tree file ${f} not fetchable at ${KREV}"
+                missing=1
+              fi
+            done < <({ grep -E '^\+\+\+ ' "$work/patch.patch" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u)
+            if [ "$missing" -ne 0 ]; then
+              echo "${name}|fails" >> "$STATUS_FILE"
+              return 0
+            fi
+            echo "${name}|$(classify "$name" "$work/patch.patch")" >> "$STATUS_FILE"
+          }
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            check_entry "$entry"
+          done <<'ENTRIES'
+          adios|https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/adios_ioscheduler_${KV}.patch|adios|
+          bore|https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/bore_${KV}.patch|bore|
+          bbrv3|https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3/0001-net-tcp-backport-BBRv3-to-${AV}-${KV}.patch|bbr3|
+          unicode-6.1+|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/unicode_bypass_fix_6.1+.patch|unicode|
+          unicode-6.1-|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/unicode_bypass_fix_6.1-.patch|unicode|
+          memcmp-pi|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/optimise_memcmp.patch|opt|
+          memcmp-weakpi|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/optimise_memcmp.patch|opt|s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/
+          clearpage-plain|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/clear_page_16bytes_align.patch|opt|
+          clearpage-pi|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/clear_page_16bytes_align.patch|opt|s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/
+          ipv6-nat|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/IPv6_NAT_FIX.patch|ip_set|
+          ntsync-base|https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch|ntsync|
+          ENTRIES
+
+          echo "## Patch Hygiene: ${MODEL} (${OSVER}, ${AV}-${KV})" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Patch | Result |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|-------|--------|" >> "${GITHUB_STEP_SUMMARY}"
+          while IFS='|' read -r n s; do
+            echo "| ${n} | ${s} |" >> "${GITHUB_STEP_SUMMARY}"
+          done < "$STATUS_FILE"
+          cat "$STATUS_FILE"
+
+          if [ "$STRICT" = "true" ] && grep -q '|fails$' "$STATUS_FILE"; then
+            echo "::error::strict mode: at least one patch does not apply for ${MODEL} ${OSVER}"
+            exit 1
+          fi
+
+      - name: Upload hygiene report
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-hygiene-${{ matrix.model }}_${{ matrix.os_version }}
+          path: hygiene-out/

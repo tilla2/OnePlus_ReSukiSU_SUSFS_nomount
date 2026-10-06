@@ -546,6 +546,24 @@ runs:
           cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
           return 0
         }
+        fuzz_restage() {
+          local name="$1" src="$2" md="$3" targets="$4" base="$5"
+          local f
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            [ -f "$f" ] || continue
+            cp "$f" "${md}/$f"
+          done
+          : > "${base}/fuzz.log"
+          if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/fuzz.log" 2>&1 && ! find "$md" -name '*.rej' 2>/dev/null | grep -q .; then
+            find "$md" -name '*.orig' -delete 2>/dev/null || true
+            cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+            echo "[patchgen] ${name}: staged with bounded fuzz (sandbox only); regenerating exact patch for the target tree"
+            return 0
+          fi
+          cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+          return 1
+        }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
@@ -581,11 +599,15 @@ runs:
               return 0
             else
               anchor_rescue "$name" "$src" "$verify_spec" && return 0
-              cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
-              find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
-              echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
-              echo "${name}|failed" >> "$psf"
-              return 0
+              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+                staged=1; already_ct=0; failed_ct=0
+              else
+                cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+                find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
+                echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+                echo "${name}|failed" >> "$psf"
+                return 0
+              fi
             fi
           else
             staged=0; already_ct=0; failed_ct=0
@@ -605,9 +627,13 @@ runs:
             [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
             if [ "$failed_ct" -gt 0 ]; then
               anchor_rescue "$name" "$src" "$verify_spec" && return 0
-              echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; NOT applying a partial patch"
-              echo "${name}|failed" >> "$psf"
-              return 0
+              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+                staged=1; already_ct=0; failed_ct=0
+              else
+                echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; fuzz re-stage failed; NOT applying a partial patch"
+                echo "${name}|failed" >> "$psf"
+                return 0
+              fi
             fi
           fi
           if [ "$staged" -eq 0 ]; then
@@ -2348,6 +2374,9 @@ runs:
         elif grep -q 'SYM_FUNC_START_PI(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           echo "Patching clear_page_16bytes_align.patch (sed variant for the __pi clear_page shape)"
           gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
+        elif grep -q 'SYM_FUNC_START(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
+          echo "Patching clear_page_16bytes_align.patch (sed variant for the plain __pi clear_page shape)"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
         else
           echo "::warning::clear_page_16bytes_align: unrecognized clear_page.S symbol shape; skipping"
           echo "clear_page_16bytes_align|skipped" >> "$PS_FILE"

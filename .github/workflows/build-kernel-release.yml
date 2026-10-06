@@ -116,7 +116,7 @@ on:
 
 jobs:
   set-op-model:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       device_count: ${{ steps.set-matrix.outputs.count }}
@@ -605,7 +605,7 @@ jobs:
 
   resolve-nomount:
     name: Resolve NoMount commit (locked for all kernels)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
       nomount_source: ${{ steps.resolve.outputs.nomount_source }}
@@ -704,7 +704,7 @@ jobs:
   build-nomount-module:
     name: Build NoMount module from source
     needs: resolve-nomount
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       built: ${{ steps.decide.outputs.built }}
       module_name: ${{ steps.package.outputs.module_name }}
@@ -826,7 +826,7 @@ jobs:
 
   prepare_ccache:
     name: Prepare ccache binary (download once)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # Download the custom ccache binary ONCE for the whole matrix and share it as
       # an artifact. Previously every parallel matrix job curl'd the same GitHub raw
@@ -855,7 +855,7 @@ jobs:
           fi
           echo "::endgroup::"
       - name: Upload ccache artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ccache-binary
           path: ccache
@@ -870,7 +870,7 @@ jobs:
       needs.set-op-model.result == 'success' &&
       needs.resolve-nomount.result == 'success' &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
@@ -900,7 +900,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Get prebuilt ccache (downloaded once by prepare_ccache)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ccache-binary
           path: ccache-dl
@@ -992,7 +992,7 @@ jobs:
 
       - name: Upload patch failure forensics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: patch-faillogs-${{ matrix.model }}
           path: |
@@ -1148,7 +1148,7 @@ jobs:
 
   trigger-release:
     needs: [set-op-model, resolve-nomount, build-nomount-module, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: |
       !cancelled() &&
       inputs.make_release == true &&

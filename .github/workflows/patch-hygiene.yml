@@ -35,12 +35,12 @@ concurrency:
 
 jobs:
   discover:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build check matrix
         id: matrix
@@ -85,13 +85,13 @@ jobs:
 
   hygiene:
     needs: discover
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve kernel tree and classify patches
         env:
@@ -282,7 +282,7 @@ jobs:
           fi
 
       - name: Upload hygiene report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: patch-hygiene-${{ matrix.model }}_${{ matrix.os_version }}
           path: hygiene-out/

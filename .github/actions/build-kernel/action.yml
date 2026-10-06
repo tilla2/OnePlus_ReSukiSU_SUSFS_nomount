@@ -733,9 +733,9 @@ runs:
           return 0
         }
         gen_patch_fb() {
-          # Latest-with-fallback wrapper around gen_patch. Runs the primary
-          # (latest upstream) patch first; if it does not land, wipes the stale
-          # per-patch status lines and retries once with a pinned fallback patch.
+          # Primary-with-fallback wrapper around gen_patch. Runs the primary
+          # patch first; if it does not land, wipes the stale per-patch status
+          # lines and retries once with the fallback patch.
           # Sets GEN_PATCH_FB_VIA for the caller: primary | fallback | none.
           local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
           local psf="${PS_FILE:-patch-status-raw.txt}"
@@ -748,7 +748,7 @@ runs:
           fi
           if [ -n "$fallback" ] && [ -f "$fallback" ]; then
             GEN_PATCH_FB_VIA="fallback"
-            echo "[patchgen] ${name}: latest patch did not land; falling back to $(basename "$fallback")"
+            echo "[patchgen] ${name}: primary patch did not land; falling back to $(basename "$fallback")"
             sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
             gen_patch "$name" "$fallback" "$sed_expr" "$verify_spec" || true
             grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
@@ -2822,34 +2822,49 @@ runs:
           6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
           *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
         esac
-        BORE_PRIMARY=""
-        if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
-          BORE_PRIMARY="/tmp/bore.patch"
-        else
-          echo "::warning::BoRE latest upstream unavailable (${BORE_PATCH})"
+        # Tree-exact regen patch is the PRIMARY source: pre-ported BoRE patches
+        # live in scripts/patches, keyed by kernel version
+        # (bore_<ver>_oneplus_regen.patch). They run through the same gen_patch
+        # pipeline (stage fuzz=0 -> regen -> apply fuzz=0 -> verify), so patchgen
+        # staging wins whenever a committed override exists. Bouteillepleine's
+        # upstream patch targets the reworked EEVDF base and structurally cannot
+        # stage on this tree, so the upstream fetch is the fallback, used only
+        # when no regen patch is committed for this kernel version.
+        BORE_REGEN="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
+        [ -f "$BORE_REGEN" ] || BORE_REGEN=""
+        # Fail-safe content guard: a regen patch carrying the duplicated
+        # return-curr construct (added line directly above an identical
+        # context line in a brace-less if) bootloops the device. Refuse it
+        # rather than build an unbootable kernel.
+        if [ -n "$BORE_REGEN" ] && awk '
+            /^\+[[:space:]]*return curr;[[:space:]]*$/ { if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*return curr;[[:space:]]*$/) { found = 1; exit } }
+            END { exit !(found) }
+          ' "$BORE_REGEN"; then
+          echo "::warning::bore: committed regen patch matches the duplicated return-curr bootloop signature; refusing it — re-commit the corrected bore_${KERNEL_VER}_oneplus_regen.patch"
+          BORE_REGEN=""
         fi
-        # Pinned regen fallback: pre-ported BoRE patches live in scripts/patches,
-        # keyed by kernel version (bore_<ver>_oneplus_regen.patch). Only versions
-        # with a committed override use this fallback; 6.12 ships one today.
-        BORE_FB="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
-        [ -f "$BORE_FB" ] || BORE_FB=""
-        if [ -z "$BORE_PRIMARY" ] && [ -z "$BORE_FB" ]; then
+        BORE_UPSTREAM=""
+        if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+          BORE_UPSTREAM="/tmp/bore.patch"
+        fi
+        if [ -z "$BORE_REGEN" ] && [ -z "$BORE_UPSTREAM" ]; then
           echo "::warning::BoRE patch unavailable (${BORE_PATCH}); skipping"
           echo "bore|skipped" >> "$PS_FILE"
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
         fi
-        gen_patch_fb bore "$BORE_PRIMARY" "$BORE_FB" "" "$BORE_SPEC" || true
+        gen_patch_fb bore "$BORE_REGEN" "$BORE_UPSTREAM" "" "$BORE_SPEC" || true
         if [ "${GEN_PATCH_FB_VIA:-none}" = "none" ] || ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
         fi
-        if [ "$GEN_PATCH_FB_VIA" = "fallback" ]; then
-          echo "[patchgen] bore: landed via pinned regen fallback ($(basename "$BORE_FB"))"
-          echo "BORE_VIA=pinned-regen-fallback" >> "$GITHUB_ENV"
+        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+          echo "[patchgen] bore: landed via tree-exact regen (patchgen staging, $(basename "$BORE_REGEN"))"
+          echo "BORE_VIA=patchgen-regen" >> "$GITHUB_ENV"
         else
+          echo "[patchgen] bore: landed via latest-upstream ($(basename "$BORE_UPSTREAM"))"
           echo "BORE_VIA=latest-upstream" >> "$GITHUB_ENV"
         fi
         grep -q 'config SCHED_BORE' init/Kconfig
@@ -2857,7 +2872,11 @@ runs:
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
         echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
-        echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+          echo "BORE_SOURCE=scripts/patches/$(basename "$BORE_REGEN") (tree-exact regen)" >> "$GITHUB_ENV"
+        else
+          echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+        fi
         echo "✅ BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
 
@@ -3699,7 +3718,7 @@ runs:
           echo "SusFS: $(pstat susfs)"
           echo "BBR: $(pstat bbr)"
           echo "BBRv3: $(pstat bbrv3)"
-          echo "BoRE: $(pstat bore)"
+          echo "BoRE: $(pstat bore) (via ${BORE_VIA:-n/a})"
           echo "ADIOS: $(pstat adios)"
           echo "BBG: $(pstat bbg)"
           echo "HMBIRD SCX: $(pstat hmbird)"
@@ -3771,7 +3790,7 @@ runs:
           echo "| **SusFS** | $(pstat susfs) |"
           echo "| **BBR** | $(pstat bbr) |"
           echo "| **BBRv3** | $(pstat bbrv3) |"
-          echo "| **BoRE** | $(pstat bore) |"
+          echo "| **BoRE** | $(pstat bore) (via ${BORE_VIA:-n/a}) |"
           echo "| **ADIOS** | $(pstat adios) |"
           echo "| **BBG** | $(pstat bbg) |"
           echo "| **HMBIRD SCX** | $(pstat hmbird) |"

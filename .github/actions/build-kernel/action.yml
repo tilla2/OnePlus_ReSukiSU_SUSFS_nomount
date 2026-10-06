@@ -393,6 +393,10 @@ runs:
         DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
         echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
+        KERNEL_SYNC_SHA="$(git -C "$COMMON_KERNEL_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)"
+        echo "KERNEL_SYNC_SHA=$KERNEL_SYNC_SHA" >> "$GITHUB_ENV"
+        echo "Kernel tree synced at: $KERNEL_SYNC_SHA (use this as the anchor SHA in patch-anchors.txt for any patch that stops applying at fuzz=0)"
+
     - name: Prepare patch generation harness
       shell: bash
       run: |
@@ -430,6 +434,117 @@ runs:
             }
           ' "$patch_file"
         }
+        anchor_rescue() {
+          local name="$1" patch_file="$2" verify_spec="${3:-}"
+          local anchors="$GITHUB_WORKSPACE/patch-anchors.txt"
+          local sha
+          sha=$(awk -v n="$name" '$1 == n && $2 ~ /^[0-9a-fA-F]{7,40}$/ { print $2; exit }' "$anchors" 2>/dev/null || true)
+          if [ -z "$sha" ]; then
+            echo "[patchgen] ${name}: no patch-anchors.txt entry; skipping 3-way rescue"
+            return 1
+          fi
+          local kdir="$COMMON_KERNEL_FOLDER" adir="/tmp/pg_${name}_anchor" bdir="/tmp/pg_${name}_base" mdir="/tmp/pg_${name}_merged"
+          local alog="/tmp/pg_${name}_anchor.log"
+          rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$mdir"
+          echo "[patchgen] ${name}: staging failed — attempting anchor 3-way merge (base ${sha})"
+          : > "$alog"
+          git -C "$kdir" fetch --depth=1 origin "$sha" >> "$alog" 2>&1 || true
+          if ! git -C "$kdir" cat-file -e "$sha" 2>/dev/null; then
+            echo "::warning::[patchgen] ${name}: anchor ${sha} not fetchable from origin; rescue aborted"
+            return 1
+          fi
+          if ! git -C "$kdir" archive "$sha" | tar -x -C "$adir" >> "$alog" 2>&1; then
+            echo "::warning::[patchgen] ${name}: anchor ${sha} archive failed; rescue aborted"
+            return 1
+          fi
+          if ! patch -p1 --dry-run --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1; then
+            echo "::warning::[patchgen] ${name}: patch does not apply cleanly on anchor ${sha} (stale anchor); rescue aborted"
+            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+            return 1
+          fi
+          local targets f rc status=0
+          targets=$( { grep -E '^(\+\+\+|---) ' "$patch_file" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+          patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1 || true
+          : > "${mdir}/.ops"
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            if [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p "$kdir/$f" "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              cp "$adir/$f" "${mdir}/$f"
+              echo "keep $f" >> "${mdir}/.ops"
+            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p "$kdir/$f" /dev/null "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (created on both sides, exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            elif [ -f "$bdir/$f" ] && [ ! -f "$adir/$f" ]; then
+              if [ -f "$kdir/$f" ] && cmp -s "$kdir/$f" "$bdir/$f"; then
+                echo "delete $f" >> "${mdir}/.ops"
+              else
+                echo "conflict: $f (deleted by patch but modified in tree)" >> "$alog"; status=1
+              fi
+            elif [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+              mkdir -p "${mdir}/$(dirname "$f")"
+              git merge-file -L ours -L base -L theirs -p /dev/null "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "conflict: $f (missing in tree, exit $rc)" >> "$alog"; status=1
+              else
+                echo "keep $f" >> "${mdir}/.ops"
+              fi
+            else
+              echo "conflict: $f (unresolvable file state)" >> "$alog"; status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::[patchgen] ${name}: anchor 3-way merge hit conflicts; patch rejected (all-or-nothing)"
+            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+            return 1
+          fi
+          if [ -n "$verify_spec" ]; then
+            local spec vrc=0
+            local -a vlist
+            ( cd "$mdir" || exit 1
+              IFS=';' read -ra vlist <<< "$verify_spec"
+              for spec in "${vlist[@]}"; do
+                [ -n "$spec" ] || continue
+                case "$spec" in
+                  g:*) verify_grep "${spec#g:}" || { vrc=1; break; } ;;
+                  f:*) verify_infn "${spec#f:}" || { vrc=1; break; } ;;
+                esac
+              done ) || vrc=1
+            if [ "$vrc" -ne 0 ]; then
+              echo "::warning::[patchgen] ${name}: anchor-merged result failed verification; patch rejected"
+              cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+              return 1
+            fi
+            echo "[patchgen] ${name}: anchor-merge verification passed"
+          fi
+          local op p
+          while read -r op; do
+            case "$op" in
+              keep\ *) p="${op#keep }"; cp "${mdir}/${p}" "${kdir}/${p}" ;;
+              delete\ *) p="${op#delete }"; rm -f "${kdir}/${p}" ;;
+            esac
+          done < "${mdir}/.ops"
+          echo "[patchgen] ${name}: applied via anchor 3-way merge (base ${sha})"
+          echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
+          cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+          return 0
+        }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
@@ -464,6 +579,7 @@ runs:
               echo "${name}|already" >> "$psf"
               return 0
             else
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
               cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
               find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
               echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
@@ -487,6 +603,7 @@ runs:
             echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
             [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
             if [ "$failed_ct" -gt 0 ]; then
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
               echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; NOT applying a partial patch"
               echo "${name}|failed" >> "$psf"
               return 0
@@ -498,6 +615,7 @@ runs:
               echo "[patchgen] ${name}: change already present in tree"
               echo "${name}|already" >> "$psf"
             else
+              anchor_rescue "$name" "$src" "$verify_spec" && return 0
               echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
               echo "${name}|failed" >> "$psf"
             fi

@@ -40,9 +40,9 @@ on:
         type: choice
         options:
           - KSUN
-          - ReSukiSU
+          - BakaSU
           - KSU
-        default: ReSukiSU
+        default: BakaSU
       ksu_branch_or_hash:
         description: 'KSU branch or commit hash'
         type: string
@@ -241,9 +241,9 @@ jobs:
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
-          if [ "$ksu_type" == "ReSukiSU" ]; then
-            KSU_REPO_OWNER="ReSukiSU"
-            KSU_REPO_NAME="ReSukiSU"
+          if [ "$ksu_type" == "BakaSU" ]; then
+            KSU_REPO_OWNER="Baka-SU"
+            KSU_REPO_NAME="BakaSU"
           elif [ "$ksu_type" == "KSUN" ]; then
             KSU_REPO_OWNER="KernelSU-Next"
             KSU_REPO_NAME="KernelSU-Next"
@@ -514,7 +514,7 @@ jobs:
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
           ksu_display=""
-          if [ "$ksu_type" = "ReSukiSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ]; then
+          if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ]; then
             if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
               ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
             else
@@ -1019,8 +1019,8 @@ jobs:
             echo ""
             echo "Outputs:"
             echo "  - Kernel: ${{ steps.build.outputs.kernel_version }}"
-            if [ "${{ matrix.ksu_type }}" = "ReSukiSU" ]; then
-              echo "  - ReSukiSU: v${{ steps.build.outputs.ksu_version }}"
+            if [ "${{ matrix.ksu_type }}" = "BakaSU" ]; then
+              echo "  - BakaSU: v${{ steps.build.outputs.ksu_version }}"
             elif [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
               echo "  - KernelSU Next: v${{ steps.build.outputs.ksu_version }}"
             else
@@ -1073,9 +1073,9 @@ jobs:
           |--------|-------|
           | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
           EOF
-            if [ "${{ matrix.ksu_type }}" = "ReSukiSU" ]; then
+            if [ "${{ matrix.ksu_type }}" = "BakaSU" ]; then
               cat >> $GITHUB_STEP_SUMMARY << EOF
-          | **ReSukiSU** | v${{ steps.build.outputs.ksu_version }} |
+          | **BakaSU** | v${{ steps.build.outputs.ksu_version }} |
           EOF
                       elif [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
                         cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -1175,8 +1175,8 @@ jobs:
             KSUN)
               root_display="KernelSU Next"
               ;;
-            ReSukiSU)
-              root_display="ReSukiSU"
+            BakaSU)
+              root_display="BakaSU"
               ;;
             KSU)
               root_display="KernelSU"
@@ -1258,7 +1258,7 @@ jobs:
 
           case "${{ inputs.ksu_type }}" in
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
-            ReSukiSU)  MANAGER_REPO="ReSukiSU/ReSukiSU" ;;
+            BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
           esac
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
@@ -1500,10 +1500,10 @@ jobs:
           | **KernelSU Next Branch/Hash** | \`$ksu_display\` |
           | **KernelSU Next Version** | \`$ksu_ver_global\` |
           EOF
-          elif [ "$ksu_type" = "ReSukiSU" ]; then
+          elif [ "$ksu_type" = "BakaSU" ]; then
             cat << EOF >> release_notes.md
-          | **ReSukiSU Branch/Hash** | \`$ksu_display\` |
-          | **ReSukiSU Version** | \`$ksu_ver_global\` |
+          | **BakaSU Branch/Hash** | \`$ksu_display\` |
+          | **BakaSU Version** | \`$ksu_ver_global\` |
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
@@ -1538,9 +1538,9 @@ jobs:
             cat << EOF >> release_notes.md
           - **KernelSU Next** - Kernel-level root integration
           EOF
-          elif [ "$ksu_type" == "ReSukiSU" ]; then
+          elif [ "$ksu_type" == "BakaSU" ]; then
             cat << EOF >> release_notes.md
-          - **ReSukiSU** - Kernel-based Android root integration
+          - **BakaSU** - Kernel-based Android root integration
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
@@ -1629,9 +1629,9 @@ jobs:
             cat << EOF >> release_notes.md
           - **[KernelSU Next Team](https://github.com/KernelSU-Next/KernelSU-Next)** - Root solution
           EOF
-          elif [ "$ksu_type" == "ReSukiSU" ]; then
+          elif [ "$ksu_type" == "BakaSU" ]; then
             cat << EOF >> release_notes.md
-          - **[ReSukiSU Team](https://github.com/ReSukiSU/ReSukiSU)** - Root solution
+          - **[BakaSU Team](https://github.com/Baka-SU/BakaSU)** - Root solution
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md

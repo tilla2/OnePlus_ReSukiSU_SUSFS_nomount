@@ -63,6 +63,7 @@ jobs:
           case "$root_token" in
             KSUN) root_display="KernelSU Next" ;;
             ReSukiSU) root_display="ReSukiSU" ;;
+            BakaSU) root_display="BakaSU" ;;
             KSU) root_display="KernelSU" ;;
             *)
               echo "::error::Unsupported root implementation '${root_token}' in release '${RELEASE_TAG}'."

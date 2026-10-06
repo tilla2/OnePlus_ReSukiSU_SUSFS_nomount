@@ -457,9 +457,9 @@ runs:
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
           : > "${base}/stage.log"
           if [ -z "$hlist" ]; then
-            if patch -p1 --forward --fuzz=3 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
+            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
               staged=1; already_ct=0; failed_ct=0
-            elif patch -p1 --dry-run -R --fuzz=3 -d "$md" < "$src" >/dev/null 2>&1; then
+            elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
               echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean at staging)"
               echo "${name}|already" >> "$psf"
               return 0
@@ -486,6 +486,11 @@ runs:
             find "$md" -name '*.orig' -delete 2>/dev/null || true
             echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
             [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+            if [ "$failed_ct" -gt 0 ]; then
+              echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; NOT applying a partial patch"
+              echo "${name}|failed" >> "$psf"
+              return 0
+            fi
           fi
           if [ "$staged" -eq 0 ]; then
             if [ "$already_ct" -gt 0 ]; then
@@ -498,7 +503,6 @@ runs:
             fi
             return 0
           fi
-          [ "$failed_ct" -eq 0 ] || echo "::warning::[patchgen] ${name}: staged ${staged} hunk(s), ${failed_ct} not stageable; regenerating from staged state"
           ( cd "$base" && diff -ruN unmodified modified ) > "${base}/regen.patch" || true
           if patch -p1 --forward --fuzz=0 < "${base}/regen.patch" > "${base}/apply.log" 2>&1; then
             :

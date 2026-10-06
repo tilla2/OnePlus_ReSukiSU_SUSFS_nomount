@@ -1,5 +1,5 @@
-name: 'Build OnePlus Kernel with KernelSU Next / KernelSU / ReSukiSU'
-description: 'GitHub Action to build OnePlus kernels with KernelSU Next, KernelSU, or ReSukiSU plus SUSFS and NoMount integration'
+name: 'Build OnePlus Kernel with KernelSU Next / KernelSU / BakaSU'
+description: 'GitHub Action to build OnePlus kernels with KernelSU Next, KernelSU, or BakaSU plus SUSFS and NoMount integration'
 inputs:
   op_config_json:
     description: 'JSON string containing full device config'
@@ -11,7 +11,7 @@ inputs:
     type: choice
     options:
       - KSU
-      - ReSukiSU
+      - BakaSU
       - KSUN
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash (empty = auto-detect by ksu_type)'
@@ -393,6 +393,53 @@ runs:
         DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
         echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
+    - name: Prepare patch generation harness
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/patchgen" "$GITHUB_WORKSPACE/patch-faillogs"
+        cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
+        gen_patch() {
+          local name="$1" patch_file="$2" sed_expr="${3:-}"
+          local base="$GITHUB_WORKSPACE/patchgen/${name}" um="${base}/unmodified" md="${base}/modified"
+          rm -rf "$base" && mkdir -p "$um" "$md"
+          local src="/tmp/pg_${name}.patch"
+          if [ -n "$sed_expr" ]; then sed -e "$sed_expr" "$patch_file" > "$src"; else cp "$patch_file" "$src"; fi
+          local targets f
+          targets=$( { grep -E '^\+\+\+ ' "$src" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+          if [ -z "$targets" ]; then
+            echo "::warning::[patchgen] ${name} patch exposes no file targets; not applied"
+            echo "${name}|failed" >> "${PS_FILE:-patch-status-raw.txt}"
+            return 0
+          fi
+          for f in $targets; do
+            case "$f" in /dev/null) continue ;; esac
+            [ -f "$f" ] || continue
+            mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
+            cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
+          done
+          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+          if patch -p1 --forward --fuzz=3 -d "$md" < "$src" > "${base}/stage.log" 2>&1; then
+            :
+          else
+            cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+            find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+            echo "${name}|failed" >> "${PS_FILE:-patch-status-raw.txt}"
+            return 0
+          fi
+          diff -ruN "$um" "$md" > "${base}/regen.patch" || true
+          if patch -p1 --forward --fuzz=0 < "${base}/regen.patch" > "${base}/apply.log" 2>&1; then
+            echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
+          else
+            cp "${base}/apply.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_apply.log" 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} regenerated patch did not apply; not applied"
+            echo "${name}|failed" >> "${PS_FILE:-patch-status-raw.txt}"
+          fi
+          return 0
+        }
+        GEN_PATCH_EOF
+        echo "patch generation harness ready"
     - name: Set Kernel build-tools to Path
       shell: bash
       run: |
@@ -1062,19 +1109,19 @@ runs:
         echo "✅ KernelSU Next added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
-    - name: Add ReSukiSU
+    - name: Add BakaSU
       shell: bash
-      if: ${{ inputs.ksu_type == 'ReSukiSU' }}
+      if: ${{ inputs.ksu_type == 'BakaSU' }}
       run: |
         set -euo pipefail
-        echo "::group::Add ReSukiSU"
+        echo "::group::Add BakaSU"
         cd "$KERNEL_PLATFORM_FOLDER"
-        echo "Adding ReSukiSU..."
+        echo "Adding BakaSU..."
         
         if [ "${{ inputs.ksu_branch_or_hash }}" = "" ]; then
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
         else
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch_or_hash }}"
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch_or_hash }}"
         fi
         
         cd KernelSU
@@ -1087,22 +1134,22 @@ runs:
         
         cd ..
         
-        echo "ReSukiSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "BakaSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
         
-        echo "ReSukiSU Version: $KSU_VERSION"
-        echo "✅ ReSukiSU added (commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "BakaSU Version: $KSU_VERSION"
+        echo "✅ BakaSU added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
-    - name: Add ReSukiSU Root Tag
-      if: ${{ inputs.ksu_type == 'ReSukiSU' && env.OP_ROOT_TAG != '' }}
+    - name: Add BakaSU Root Tag
+      if: ${{ inputs.ksu_type == 'BakaSU' && env.OP_ROOT_TAG != '' }}
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Add ReSukiSU root tag"
+        echo "::group::Add BakaSU root tag"
         if ! grep -rq 'config KSU_FULL_NAME_FORMAT' "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel/Kconfig"; then
-          echo "::warning::ReSukiSU Kconfig has no KSU_FULL_NAME_FORMAT symbol, skipping root tag"
+          echo "::warning::BakaSU Kconfig has no KSU_FULL_NAME_FORMAT symbol, skipping root tag"
           echo "::endgroup::"
           exit 0
         fi
@@ -1149,7 +1196,7 @@ runs:
               cd "$KSU_FOLDER"
               patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not apply cleanly (soft-fail, continuing)"
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
@@ -1157,7 +1204,7 @@ runs:
               cd "$KSU_FOLDER"
               patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
           "v2.2.0"|"v2.3.0")
@@ -1309,7 +1356,7 @@ runs:
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
           *)
@@ -1661,34 +1708,27 @@ runs:
         echo "::endgroup::"
 
     - name: Enable ADIOS I/O Scheduler
-      if: ${{ env.OP_ADIOS == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Enable ADIOS I/O scheduler"
         cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         if [ ! -f block/adios.c ]; then
           ADIOS_FILE="adios_ioscheduler_${KERNEL_VER}.patch"
           case "${OP_BRANCH:-}" in
             *mt6989*) [ "$KERNEL_VER" = "6.1" ] && ADIOS_FILE="adios_ioscheduler_6.1_mt6989.patch" ;;
           esac
-          curl -sSL --fail -o /tmp/adios.patch             "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
-          if ! patch -p1 --dry-run --forward < /tmp/adios.patch; then
-            echo "::warning::ADIOS patch does not apply for ${KERNEL_VER} (${ADIOS_FILE}) — soft-skipping ADIOS, build continues without it"
-            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-            {
-              echo "=== ADIOS probe FAILED for kernel ${KERNEL_VER} (${ADIOS_FILE}) ==="
-              echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
-              patch -p1 --dry-run --forward < /tmp/adios.patch 2>&1 || true
-            } > "$GITHUB_WORKSPACE/patch-faillogs/adios_${KERNEL_VER}.log" 2>&1
+          curl -sSL --fail -o /tmp/adios.patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${ADIOS_FILE}"
+          gen_patch adios /tmp/adios.patch
+          if [ "$(grep -xc 'adios|applied' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
             echo "ADIOS_SKIPPED=${ADIOS_FILE}" >> "$GITHUB_ENV"
-            echo "adios|skipped" >> "$PS_FILE"
             echo "::endgroup::"
             exit 0
           fi
-          patch -p1 --forward < /tmp/adios.patch
         else
           echo "block/adios.c already present, enabling config only"
+          echo "adios|applied" >> "$PS_FILE"
         fi
         grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
         grep -q 'adios.o' block/Makefile
@@ -1700,7 +1740,6 @@ runs:
         echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
         echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
         echo "ADIOS I/O scheduler enabled"
-        echo "adios|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -1746,24 +1785,27 @@ runs:
         echo "ksu_hooks|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
-    - name: Apply Other Patches
+    - name: Apply gki_ptrace patch
       shell: bash
       run: |
         set -euo pipefail
-        echo "::group::Apply Other patches"
+        echo "::group::Apply gki_ptrace"
         cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
         MIN_VERSION="5.16"
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching ptrace!"
-          if ! patch -p1 --fuzz=2 < "$KERNEL_PATCHES_FOLDER/gki_ptrace.patch"; then
-            echo "::error::gki_ptrace patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
+          gen_patch gki_ptrace "$KERNEL_PATCHES_FOLDER/gki_ptrace.patch"
         else
           echo "Kernel >= $MIN_VERSION, skipping ptrace patch"
         fi
+        echo "::endgroup::"
+    - name: Apply HMBIRD Fengchi patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply HMBIRD Fengchi patches"
+        cd "$COMMON_KERNEL_FOLDER"
         if [ "$OP_HMBIRD" = true ]; then
           echo "Patching hmbird!"
           HMBIRD_MODEL=$(echo "$OP_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')
@@ -1777,12 +1819,9 @@ runs:
             OP13-6.6.30)
               HMBIRD_MODEL="OP13-PJZ" ;;
           esac
-          # Upstream WildKernels/kernel_patches names fengchi patches with the
-          # A14/A15/A16 OS convention (e.g. fengchi_OP13T_A16.patch). This fork
-          # keeps OOS naming everywhere else, so translate OOS<NN> -> A<NN> only
-          # for the fengchi filename lookup against the upstream patches repo.
           HMBIRD_OS="${OP_OS_VERSION/OOS/A}"
           dos2unix "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          FENGCHI_OK=true
           if ! patch -p1 --fuzz=2 < "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"; then
             echo "::warning::hmbird fengchi patch did not apply cleanly. Applying known compatibility fallbacks."
             if [ -f kernel/fork.c.rej ] && grep -Fq 'sched_ext_free(tsk);' kernel/fork.c.rej; then
@@ -1790,15 +1829,19 @@ runs:
               if [ "$sched_ext_free_count" -eq 1 ]; then
                 perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
                 if grep -Fq 'sched_ext_free(tsk);' kernel/fork.c; then
+                  echo "hmbird|failed" >> "$PS_FILE"
                   echo "::error::Failed to adapt kernel/fork.c for HMBIRD"
                   exit 1
                 fi
                 rm kernel/fork.c.rej
                 echo "Applied HMBIRD kernel/fork.c compatibility fallback"
               else
+                echo "hmbird|failed" >> "$PS_FILE"
                 echo "::error::Expected one sched_ext_free() call for the HMBIRD fallback, found $sched_ext_free_count"
                 exit 1
               fi
+            else
+              FENGCHI_OK=false
             fi
             find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
             find . -name "*.rej" -delete 2>/dev/null || true
@@ -1816,15 +1859,29 @@ runs:
             find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
             find . -name "*.rej" -delete 2>/dev/null || true
           fi
+          if [ "$FENGCHI_OK" = true ]; then
+            echo "hmbird|applied" >> "$PS_FILE"
+          else
+            echo "hmbird|failed" >> "$PS_FILE"
+          fi
         else
-          echo "hmbird|applied" >> "$PS_FILE"
+          echo "hmbird|skipped" >> "$PS_FILE"
           echo "Hmbird not enabled, skipping fengchi patch"
         fi
-
-        echo "Patching module intercept and overlay mechanism"
+        echo "::endgroup::"
+    - name: Apply module overlay
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply module overlay"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         MODULE_OVERLAY_PATCH="$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-$ANDROID_VER-$KERNEL_VER.patch"
-        patch -p1 -F 3 < "$MODULE_OVERLAY_PATCH"
-
+        gen_patch module_overlay "$MODULE_OVERLAY_PATCH"
+        if [ "$(grep -xc 'module_overlay|applied' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+          echo "::error::Module overlay patch did not apply - the module intercept mechanism is required"
+          exit 1
+        fi
         MODULE_OVERLAY_DIR=""
         if [ -d "$COMMON_KERNEL_FOLDER/kernel/module/module_overlay" ]; then
           MODULE_OVERLAY_DIR="$COMMON_KERNEL_FOLDER/kernel/module/module_overlay"
@@ -1835,15 +1892,11 @@ runs:
           exit 1
         fi
         chmod +x "$MODULE_OVERLAY_DIR/convert_overlay.sh"
-
         copied_modules=""
         SOC="${OP_BRANCH#*/}"
-
         declare -A selected_file=()
         declare -A selected_priority=()
         selected_count=0
-
-        # Define suffixes in order of priority (1 to 7)
         suffixes=(
           "_${OP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}.ko"
           "_${SOC}_${OP_OS_VERSION}_${KERNEL_FULL_VER}.ko"
@@ -1853,33 +1906,24 @@ runs:
           "_${SOC}.ko"
           "_${KERNEL_FULL_VER}.ko"
         )
-
         while IFS= read -r -d '' file; do
           filename="${file##*/}"
           module_name=""
           priority=0
-
           exact_module_name=$(modinfo -F name "$file" 2>/dev/null)
-
-          # Evaluate priorities by iterating through the ordered suffixes
           for i in "${!suffixes[@]}"; do
             suffix="${suffixes[$i]}"
             if [[ "$filename" == *"$suffix" ]]; then
               extracted_name="${filename%"$suffix"}"
               extracted_normalized="${extracted_name//-/_}"
-
               if [[ "$extracted_normalized" == "$exact_module_name" ]]; then
                 module_name="$extracted_name"
                 priority=$((i + 1))
               fi
-
-              break # Match found, stop checking lower priorities
+              break
             fi
           done
-
-          # File did not match any supported naming pattern.
           [[ -n "$module_name" ]] || continue
-
           if [[ -z "${selected_priority[$module_name]+exists}" ]]; then
             echo "New module: $file"
             selected_file["$module_name"]="$file"
@@ -1891,212 +1935,215 @@ runs:
             selected_priority["$module_name"]="$priority"
           fi
         done < <(find "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/modules/" -type f -name '*.ko' -print0)
-
         if (( selected_count == 0 )); then
           echo "No matching kernel modules found."
         fi
-
         for module_name in "${!selected_file[@]}"; do
           file="${selected_file[$module_name]}"
           priority="${selected_priority[$module_name]}"
           echo "Copying module '$module_name' priority=$priority: $file"
-
           dest_path="$MODULE_OVERLAY_DIR/modules/${module_name}.ko"
           cp -v -- "$file" "$dest_path"
-
           if [ -z "$copied_modules" ]; then
             copied_modules="$dest_path"
           else
             copied_modules="$copied_modules:$dest_path"
           fi
         done
-
         ccache --set-config=extra_files_to_hash="$copied_modules"
-        
-        echo "Patching optimized_mem_operations.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/optimized_mem_operations.patch"; then
-          echo "::error::optimized_mem_operations patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching file_struct_8bytes_align.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/file_struct_8bytes_align.patch"; then
-          echo "::error::file_struct_8bytes_align patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_cache_pressure.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_cache_pressure.patch"; then
-          echo "::error::reduce_cache_pressure patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
-        echo "Patching mem_opt_prefetch.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/mem_opt_prefetch.patch"; then
-          echo "::error::mem_opt_prefetch patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
+        echo "module overlay applied"
+        echo "::endgroup::"
+    - name: Apply optimized_mem_operations patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch optimized_mem_operations "$KERNEL_PATCHES_FOLDER/common/optimized_mem_operations.patch"
+    - name: Apply file_struct_8bytes_align patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch file_struct_8bytes_align "$KERNEL_PATCHES_FOLDER/common/file_struct_8bytes_align.patch"
+    - name: Apply reduce_cache_pressure patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_cache_pressure "$KERNEL_PATCHES_FOLDER/common/reduce_cache_pressure.patch"
+    - name: Apply mem_opt_prefetch patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch mem_opt_prefetch "$KERNEL_PATCHES_FOLDER/common/mem_opt_prefetch.patch"
+    - name: Apply optimise_memcmp patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        KERNEL_VERSION="${{ env.KERNEL_VER }}"
+        MIN_VERSION="5.16"
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | tail -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching optimise_memcmp.patch"
-          if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch"; then
-            echo "::error::optimise_memcmp patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
+          gen_patch optimise_memcmp "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch"
         elif [ "$(printf '%s\n' "$KERNEL_VERSION" "5.11" | sort -V | tail -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching optimise_memcmp.patch (sed variant)"
-          if ! sed -e 's/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/' -e 's/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/' -e 's/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/' "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch" | patch -p1 --forward; then
-            echo "::error::optimise_memcmp (sed variant) patch failed. Dumping all .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          fi
+          echo "Patching optimise_memcmp.patch (sed variant for 5.11)"
+          gen_patch optimise_memcmp "$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
         else
-          echo "Optimised memcmp patch not found!"
+          echo "Optimised memcmp patch not applicable for this kernel version"
         fi
-        echo "Patching minimise_wakeup_time.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/minimise_wakeup_time.patch"; then
-          echo "::error::minimise_wakeup_time patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching int_sqrt.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/int_sqrt.patch"; then
-          echo "::error::int_sqrt patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching force_tcp_nodelay.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/force_tcp_nodelay.patch"; then
-          echo "::error::force_tcp_nodelay patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_gc_thread_sleep_time.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_gc_thread_sleep_time.patch"; then
-          echo "::error::reduce_gc_thread_sleep_time patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching add_timeout_wakelocks_globally.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/add_timeout_wakelocks_globally.patch"; then
-          echo "::error::add_timeout_wakelocks_globally patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching f2fs_reduce_congestion.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/f2fs_reduce_congestion.patch"; then
-          echo "::error::f2fs_reduce_congestion patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_freeze_timeout.patch"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_freeze_timeout.patch"; then
-          echo "::error::reduce_freeze_timeout patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        
+    - name: Apply minimise_wakeup_time patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch minimise_wakeup_time "$KERNEL_PATCHES_FOLDER/common/minimise_wakeup_time.patch"
+    - name: Apply int_sqrt patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch int_sqrt "$KERNEL_PATCHES_FOLDER/common/int_sqrt.patch"
+    - name: Apply force_tcp_nodelay patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch force_tcp_nodelay "$KERNEL_PATCHES_FOLDER/common/force_tcp_nodelay.patch"
+    - name: Apply reduce_gc_thread_sleep_time patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_gc_thread_sleep_time "$KERNEL_PATCHES_FOLDER/common/reduce_gc_thread_sleep_time.patch"
+    - name: Apply add_timeout_wakelocks_globally patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch add_timeout_wakelocks_globally "$KERNEL_PATCHES_FOLDER/common/add_timeout_wakelocks_globally.patch"
+    - name: Apply f2fs_reduce_congestion patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch f2fs_reduce_congestion "$KERNEL_PATCHES_FOLDER/common/f2fs_reduce_congestion.patch"
+    - name: Apply reduce_freeze_timeout patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_freeze_timeout "$KERNEL_PATCHES_FOLDER/common/reduce_freeze_timeout.patch"
+    - name: Apply clear_page_16bytes_align patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        KERNEL_VERSION="${{ env.KERNEL_VER }}"
+        MIN_VERSION="5.16"
         if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
-          echo "Patching clear_page_16bytes_align.patch"
-          if patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"; then
-            patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
-          else
-            echo "::warning::clear_page_16bytes_align patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
-            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-            patch -p1 --dry-run --forward < "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_dryrun.log" 2>&1 || true
-          fi
+          gen_patch clear_page_16bytes_align "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
         else
           echo "Patching clear_page_16bytes_align.patch (sed variant)"
-          if cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward; then
-            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --fuzz=2 --forward
-          else
-            echo "::warning::clear_page_16bytes_align (sed variant) patch does not apply for this tree - skipping WITHOUT touching the tree (alignment optimization only)"
-            mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-            cat "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' | patch -p1 --dry-run --fuzz=2 --forward > "$GITHUB_WORKSPACE/patch-faillogs/clear_page_align_sed_dryrun.log" 2>&1 || true
-          fi
+          gen_patch clear_page_16bytes_align "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
         fi
-        
-        
-        echo "Patching add_limitation_scaling_min_freq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"; then
-          echo "::error::add_limitation_scaling_min_freq patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching re_write_limitation_scaling_min_freq.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"; then
-          echo "::error::re_write_limitation_scaling_min_freq patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching adjust_cpu_scan_order.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"; then
-          echo "::error::adjust_cpu_scan_order patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching avoid_extra_s2idle_wake_attempts.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/avoid_extra_s2idle_wake_attempts.patch"; then
-          echo "::error::avoid_extra_s2idle_wake_attempts patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching disable_cache_hot_buddy.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/disable_cache_hot_buddy.patch"; then
-          echo "::error::disable_cache_hot_buddy patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching f2fs_enlarge_min_fsync_blocks.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/f2fs_enlarge_min_fsync_blocks.patch"; then
-          echo "::error::f2fs_enlarge_min_fsync_blocks patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching increase_ext4_default_commit_age.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/increase_ext4_default_commit_age.patch"; then
-          echo "::error::increase_ext4_default_commit_age patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching increase_sk_mem_packets.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/increase_sk_mem_packets.patch"; then
-          echo "::error::increase_sk_mem_packets patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching reduce_pci_pme_wakeups.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/reduce_pci_pme_wakeups.patch"; then
-          echo "::error::reduce_pci_pme_wakeups patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching silence_irq_cpu_logspam.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/silence_irq_cpu_logspam.patch"; then
-          echo "::error::silence_irq_cpu_logspam patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching silence_system_logspam.patch"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"; then
-          echo "::error::silence_system_logspam patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
-        echo "Patching use_unlikely_wrap_cpufreq.patch"
-        if patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"; then
-          patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
-        else
-          echo "::warning::use_unlikely_wrap_cpufreq patch does not apply for this tree - skipping WITHOUT touching the tree (cpufreq optimization only)"
-          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-          patch -p1 --dry-run --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch" > "$GITHUB_WORKSPACE/patch-faillogs/use_unlikely_wrap_cpufreq_dryrun.log" 2>&1 || true
-        fi
-        
-        echo "✅ Other patches applied"
-        echo "::endgroup::"
+    - name: Apply add_limitation_scaling_min_freq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch add_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"
+    - name: Apply re_write_limitation_scaling_min_freq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch re_write_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"
+    - name: Apply adjust_cpu_scan_order patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch adjust_cpu_scan_order "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"
+    - name: Apply avoid_extra_s2idle_wake_attempts patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch avoid_extra_s2idle_wake_attempts "$KERNEL_PATCHES_FOLDER/common/avoid_extra_s2idle_wake_attempts.patch"
+    - name: Apply disable_cache_hot_buddy patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch disable_cache_hot_buddy "$KERNEL_PATCHES_FOLDER/common/disable_cache_hot_buddy.patch"
+    - name: Apply f2fs_enlarge_min_fsync_blocks patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch f2fs_enlarge_min_fsync_blocks "$KERNEL_PATCHES_FOLDER/common/f2fs_enlarge_min_fsync_blocks.patch"
+    - name: Apply increase_ext4_default_commit_age patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch increase_ext4_default_commit_age "$KERNEL_PATCHES_FOLDER/common/increase_ext4_default_commit_age.patch"
+    - name: Apply increase_sk_mem_packets patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch increase_sk_mem_packets "$KERNEL_PATCHES_FOLDER/common/increase_sk_mem_packets.patch"
+    - name: Apply reduce_pci_pme_wakeups patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch reduce_pci_pme_wakeups "$KERNEL_PATCHES_FOLDER/common/reduce_pci_pme_wakeups.patch"
+    - name: Apply silence_irq_cpu_logspam patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch silence_irq_cpu_logspam "$KERNEL_PATCHES_FOLDER/common/silence_irq_cpu_logspam.patch"
+    - name: Apply silence_system_logspam patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch silence_system_logspam "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"
+    - name: Apply use_unlikely_wrap_cpufreq patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch use_unlikely_wrap_cpufreq "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
 
     - name: Apply NTSync Patch
       shell: bash
@@ -2229,39 +2276,30 @@ runs:
         echo "bbr|applied" >> "$PS_FILE"
 
     - name: Apply BBRv3
-      if: ${{ env.OP_BBR3 == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Apply BBRv3"
         cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         BBR3_BASE="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
         MAIN_PATCH="0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch"
         DEBUGFS_PATCH="0002-net-tcp-bbr3-add-debugfs-diagnostics-and-runtime-tunables.patch"
         curl -sSL --fail -o /tmp/bbr3_main.patch "$BBR3_BASE/$MAIN_PATCH"
-        curl -sSL --fail -o /tmp/bbr3_debugfs.patch "$BBR3_BASE/$DEBUGFS_PATCH"
         if ! grep -q 'proc_dou8vec_minmax' kernel/sysctl.c; then
           curl -sSL --fail -o /tmp/bbr3_sysctl_add.patch "$BBR3_BASE/sysctl_add_proc_dou8vec_minmax.patch"
           curl -sSL --fail -o /tmp/bbr3_sysctl_fix.patch "$BBR3_BASE/sysctl_fix_data-races_in_proc_dou8vec_minmax.patch"
-          if ! patch -p1 --forward < /tmp/bbr3_sysctl_add.patch; then
-            echo "::error::BBRv3 sysctl helper (proc_dou8vec_minmax) failed for ${ANDROID_VER}-${KERNEL_VER}"
-            exit 1
-          fi
-          if ! patch -p1 --forward < /tmp/bbr3_sysctl_fix.patch; then
-            echo "::error::BBRv3 sysctl data-races fix failed for ${ANDROID_VER}-${KERNEL_VER}"
-            exit 1
-          fi
+          gen_patch bbr3-sysctl-add /tmp/bbr3_sysctl_add.patch
+          gen_patch bbr3-sysctl-fix /tmp/bbr3_sysctl_fix.patch
         fi
-        if ! patch -p1 --forward < /tmp/bbr3_main.patch; then
-          echo "::error::BBRv3 backport failed for ${ANDROID_VER}-${KERNEL_VER}"
-          exit 1
+        gen_patch bbrv3 /tmp/bbr3_main.patch
+        if [ "$(grep -xc 'bbrv3|applied' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
+          echo "::warning::BBRv3 backport does not apply for ${ANDROID_VER}-${KERNEL_VER} - build continues without it"
+          echo "::endgroup::"
+          exit 0
         fi
-        if patch -p1 --dry-run --forward < /tmp/bbr3_debugfs.patch; then
-          patch -p1 --forward < /tmp/bbr3_debugfs.patch
-          echo "BBRv3 debugfs diagnostics (0002) applied"
-        else
-          echo "::warning::0002 debugfs patch targets the 6.12 tcp_bbr3.c post-image; not compatible with ${ANDROID_VER}-${KERNEL_VER}. BBRv3 core is unaffected - skipping diagnostics only."
-        fi
+        curl -sSL --fail -o /tmp/bbr3_debugfs.patch "$BBR3_BASE/$DEBUGFS_PATCH"
+        gen_patch bbrv3-debugfs /tmp/bbr3_debugfs.patch
         grep -q 'config TCP_CONG_BBR3' net/ipv4/Kconfig
         grep -q 'tcp_bbr3' net/ipv4/Makefile
         grep -q '^CONFIG_TCP_CONG_BBR=y' arch/arm64/configs/gki_defconfig || \
@@ -2272,41 +2310,31 @@ runs:
           echo 'CONFIG_TCP_CONG_BBR3=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
         echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
-        echo "bbrv3|applied" >> "$PS_FILE"
         echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
         echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
 
     - name: Apply BoRE
-      if: ${{ env.OP_BORE == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Apply BoRE scheduler"
         cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         BORE_PATCH="bore_${KERNEL_VER}.patch"
         curl -sSL --fail -o /tmp/bore.patch \
           "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}"
-        if ! patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch; then
-          echo "::warning::BoRE patch does not apply for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) — soft-skipping BoRE, build continues without it"
-          mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
-          {
-            echo "=== BoRE probe FAILED for ${ANDROID_VER}-${KERNEL_VER} (${BORE_PATCH}) ==="
-            echo "=== NOTHING was applied to the tree; dry-run rejection forensics follow ==="
-            patch -p1 --dry-run --forward --fuzz=0 < /tmp/bore.patch 2>&1 || true
-          } > "$GITHUB_WORKSPACE/patch-faillogs/bore_${KERNEL_VER}.log" 2>&1
+        gen_patch bore /tmp/bore.patch
+        if [ "$(grep -xc 'bore|applied' "$PS_FILE" 2>/dev/null || true)" != "1" ]; then
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
-          echo "bore|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
         fi
-        patch -p1 --forward --fuzz=0 < /tmp/bore.patch
         grep -q 'config SCHED_BORE' init/Kconfig
         grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
         echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
-        echo "bore|applied" >> "$PS_FILE"
         echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
         echo "BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
@@ -3113,9 +3141,9 @@ runs:
           echo "Kernel Uname: ${{ env.KERNEL_UNAME }}"
           echo "Build User: ${{ env.BUILD_USER }}"
           echo "Build Host: ${{ env.BUILD_HOST }}"
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "ReSukiSU Version: ${KSUVER:-unknown}"
-            echo "ReSukiSU commit SHA: ${KSU_SHA:-unknown}"
+          if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+            echo "BakaSU Version: ${KSUVER:-unknown}"
+            echo "BakaSU commit SHA: ${KSU_SHA:-unknown}"
           else
             echo "KSU Version: ${KSUVER:-unknown}"
             echo "KSU commit SHA: ${KSU_SHA:-unknown}"
@@ -3169,15 +3197,15 @@ runs:
           echo "| **Build User** | ${{ env.BUILD_USER }} |"
           echo "| **Build Host** | ${{ env.BUILD_HOST }} |"
           
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "| **ReSukiSU Version** | ${KSUVER:-unknown} |"
+          if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+            echo "| **BakaSU Version** | ${KSUVER:-unknown} |"
           else
             echo "| **KSU Version** | ${KSUVER:-unknown} |"
           fi
           
           if [ "$KSU_SHA" != "unknown" ]; then
-            if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-              echo "| **ReSukiSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/ReSukiSU/ReSukiSU/commit/$KSU_SHA) |"
+            if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+              echo "| **BakaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/Baka-SU/BakaSU/commit/$KSU_SHA) |"
             else
               echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
             fi

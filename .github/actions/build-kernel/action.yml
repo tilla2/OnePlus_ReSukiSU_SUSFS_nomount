@@ -1309,6 +1309,7 @@ runs:
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
         cd "$KERNEL_PLATFORM_FOLDER"
+        cd "$KERNEL_PLATFORM_FOLDER"
         echo "Applying SUSFS patches..."
         cp "$SUSFS_FOLDER/kernel_patches/fs/"* "$COMMON_KERNEL_FOLDER/fs/"
         cp "$SUSFS_FOLDER/kernel_patches/include/linux/"* "$COMMON_KERNEL_FOLDER/include/linux/"
@@ -1515,7 +1516,15 @@ runs:
             exit 1
             ;;
         esac
-        
+        echo "::endgroup::"
+
+    - name: Apply SUSFS Kernel Patches
+      shell: bash
+      if: ${{ env.OP_SUSFS == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Apply SUSFS kernel patches"
+        cd "$KERNEL_PLATFORM_FOLDER"
         cd "$COMMON_KERNEL_FOLDER"
         if [ "${{ env.ANDROID_VER }}" = "android15" ] && [ "${{ env.KERNEL_VER }}" = "6.6" ]; then
           if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c; then
@@ -1782,7 +1791,6 @@ runs:
         fi
         
         echo "::endgroup::"
-    
     - name: Apply NoMount
       shell: bash
       run: |
@@ -2887,7 +2895,7 @@ runs:
 
     - name: Upload patch dry-run verdict
       if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: patch-dry-run-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}
         path: ${{ env.DEBUG_ARTIFACTS_DIR }}/patch_dry_run_*.txt

@@ -533,6 +533,7 @@ runs:
               return 1
             fi
             echo "[patchgen] ${name}: anchor-merge verification passed"
+            echo "✅ ${name} verified (anchor-merge)"
           fi
           local op p
           while read -r op; do
@@ -595,6 +596,10 @@ runs:
               staged=1; already_ct=0; failed_ct=0
             elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
               echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean at staging)"
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+              echo "[patchgen] ${name}: verification passed"
+              echo "✅ ${name} verified (already in tree)"
               echo "${name}|already" >> "$psf"
               return 0
             else
@@ -640,6 +645,10 @@ runs:
             if [ "$already_ct" -gt 0 ]; then
               [ "$failed_ct" -eq 0 ] || echo "::warning::[patchgen] ${name}: ${failed_ct} hunk(s) neither present nor applicable; ${already_ct} hunk(s) already in tree"
               echo "[patchgen] ${name}: change already present in tree"
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+              echo "[patchgen] ${name}: verification passed"
+              echo "✅ ${name} verified (already in tree)"
               echo "${name}|already" >> "$psf"
             else
               anchor_rescue "$name" "$src" "$verify_spec" && return 0
@@ -653,11 +662,26 @@ runs:
             :
           elif patch -p1 --dry-run -R --fuzz=0 < "${base}/regen.patch" >> "${base}/apply.log" 2>&1; then
             echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean)"
+            verify_applied "$name" "$src" \
+              || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+            echo "[patchgen] ${name}: verification passed"
+            echo "✅ ${name} verified (already in tree)"
             echo "${name}|already" >> "$psf"
             return 0
           else
             cp "${base}/apply.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_apply.log" 2>/dev/null || true
             echo "::warning::[patchgen] ${name} regenerated patch did not apply; not applied"
+            echo "${name}|failed" >> "$psf"
+            return 0
+          fi
+          if ! verify_applied "$name" "$src"; then
+            {
+              echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
+              echo "  Reverse-applying the patch to keep the tree consistent."
+            } > "${base}/verify.log"
+            patch -p1 -R --fuzz=0 < "${base}/regen.patch" >> "${base}/verify.log" 2>&1 || true
+            cp "${base}/verify.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_verify.log" 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} applied but self-verification failed; patch reverted"
             echo "${name}|failed" >> "$psf"
             return 0
           fi
@@ -685,23 +709,60 @@ runs:
               echo "${name}|failed" >> "$psf"
               return 0
             fi
+            echo "[patchgen] ${name}: verification passed (spec: ${verify_spec})"
+          else
             echo "[patchgen] ${name}: verification passed"
           fi
+          echo "✅ ${name} verified"
           echo "${name}|applied" >> "$psf"
           return 0
+        }
+        gen_patch_fb() {
+          # Latest-with-fallback wrapper around gen_patch. Runs the primary
+          # (latest upstream) patch first; if it does not land, wipes the stale
+          # per-patch status lines and retries once with a pinned fallback patch.
+          # Sets GEN_PATCH_FB_VIA for the caller: primary | fallback | none.
+          local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
+          local psf="${PS_FILE:-patch-status-raw.txt}"
+          GEN_PATCH_FB_VIA="none"
+          if [ -n "$primary" ] && [ -f "$primary" ]; then
+            GEN_PATCH_FB_VIA="primary"
+            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+            gen_patch "$name" "$primary" "$sed_expr" "$verify_spec" || true
+            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+          fi
+          if [ -n "$fallback" ] && [ -f "$fallback" ]; then
+            GEN_PATCH_FB_VIA="fallback"
+            echo "[patchgen] ${name}: latest patch did not land; falling back to $(basename "$fallback")"
+            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+            gen_patch "$name" "$fallback" "$sed_expr" "$verify_spec" || true
+            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+          fi
+          return 1
         }
         verify_grep() {
           local spec="$1"
           local file="${spec%%|*}" regex="${spec#*|}"
-          [ -e "$file" ] && grep -Eq "$regex" "$file"
+          if [ ! -e "$file" ]; then
+            echo "[patchgen] verify: ${file} not found"
+            return 1
+          fi
+          local hits
+          hits=$(grep -nE "$regex" "$file" 2>/dev/null | head -n 5 || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            return 0
+          fi
+          echo "[patchgen] verify: no match for '${regex}' in ${file}"
+          return 1
         }
         verify_infn() {
           local spec="$1"
           local file="${spec%%|*}"
           local rest="${spec#*|}"
           local func="${rest%%|*}" sym="${rest#*|}"
-          [ -f "$file" ] || return 1
-          awk -v fn="$func" -v sym="$sym" '
+          [ -f "$file" ] || { echo "[patchgen] verify: ${file} not found"; return 1; }
+          if awk -v fn="$func" -v sym="$sym" '
             $0 ~ ("^[A-Za-z_].*" fn "[[:space:]]*\\(") && $0 !~ /;[[:space:]]*$/ { infn = 1; depth = 0; seen = 0 }
             infn {
               ob = gsub(/{/, "{"); cb = gsub(/}/, "}")
@@ -711,7 +772,61 @@ runs:
               if (seen && depth <= 0) { infn = 0; seen = 0 }
             }
             END { exit (found ? 0 : 1) }
-          ' "$file"
+          ' "$file"; then
+            echo "[patchgen] verify: ${file}: '${sym}' present inside ${func}()"
+            return 0
+          fi
+          echo "[patchgen] verify: ${file}: '${sym}' NOT found inside ${func}()"
+          return 1
+        }
+        verify_applied() {
+          # Generic post-apply self-verification driven by the patch itself:
+          # sample lines the patch adds and confirm they are present in the
+          # live tree. Prints matched evidence lines; non-zero if any sampled
+          # line is missing. Handles both '+++ b/path' (upstream) and
+          # '+++ modified/path' (diff -ruN regen) header shapes.
+          local name="$1" patch_file="$2"
+          local map
+          map=$(awk '
+            /^--- / { next }
+            /^\+\+\+ / {
+              p = $2
+              if (p == "/dev/null") { cur = ""; next }
+              sub(/^[^\/]+\//, "", p)
+              cur = p; next
+            }
+            /^@@/ { next }
+            /^\+/ {
+              if (cur == "") next
+              line = substr($0, 2); sub(/\r$/, "", line)
+              if (line ~ /^[ \t]*$/) next
+              if (length(line) > 240) next
+              if (seen[cur] >= 2) next
+              if (total >= 24) next
+              print cur "\t" line
+              seen[cur]++; total++
+            }
+            BEGIN { total = 0 }
+          ' "$patch_file") || true
+          if [ -z "$map" ]; then
+            echo "[patchgen] ${name}: nothing to self-verify (no added lines)"
+            return 0
+          fi
+          local f line shown=0 miss=0
+          while IFS=$'\t' read -r f line; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ] || ! grep -qF -- "$line" "$f" 2>/dev/null; then
+              echo "[patchgen] ${name}: VERIFY MISS ${f}: ${line}"
+              miss=$((miss+1))
+              continue
+            fi
+            if [ "$shown" -lt 8 ]; then
+              grep -nF -- "$line" "$f" 2>/dev/null | head -n 1
+              shown=$((shown+1))
+            fi
+          done <<< "$map"
+          [ "$miss" -eq 0 ] || return 1
+          return 0
         }
         fetch_patch() {
           local url="$1" out="$2" min="${3:-200}"
@@ -1932,6 +2047,7 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+        grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
         if [ -f "$COMMON_KERNEL_FOLDER/fs/susfs.c" ]; then
           echo "susfs|applied" >> "$PS_FILE"
         else
@@ -2016,7 +2132,9 @@ runs:
         ls lib/lz4/lz4.c lib/lz4/lz4hc.c lib/lz4/lz4armv8/lz4accel.c > /dev/null
         echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
         echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
-        echo "LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+        grep -n 'LZ4_arm64_decompress_safe' crypto/lz4.c | head -n 2 || true
+        grep -n '1\.10\.' lib/lz4/lz4.h | head -n 2 || true
+        echo "✅ LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
         echo "lz4|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
@@ -2058,7 +2176,7 @@ runs:
         grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
         echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
         echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
-        echo "ADIOS I/O scheduler enabled"
+        echo "✅ ADIOS I/O scheduler enabled"
         echo "::endgroup::"
 
     - name: Add BBG
@@ -2080,8 +2198,15 @@ runs:
           echo "Applying BBG get_link fix"
           gen_patch bbg-getlink "$KERNEL_PATCHES_FOLDER/experimental/bbg/bbg_fix_get_link.patch"
         fi
-        echo "✅ BBG LSM added"
-        echo "bbg|applied" >> "$PS_FILE"
+        if [ -f Baseband-guard/baseband_guard.c ] || [ -f common/Baseband-guard/baseband_guard.c ]; then
+          grep -n '^CONFIG_BBG=y' common/arch/arm64/configs/gki_defconfig || true
+          grep -n 'baseband_guard' common/security/Kconfig | head -n 3 || true
+          echo "✅ BBG LSM added"
+          echo "bbg|applied" >> "$PS_FILE"
+        else
+          echo "::warning::BBG evidence check failed (baseband_guard.c missing); marking failed"
+          echo "bbg|failed" >> "$PS_FILE"
+        fi
         echo "::endgroup::"
 
     - name: Apply KSU Hooks
@@ -2176,6 +2301,9 @@ runs:
             find . -name "*.rej" -delete 2>/dev/null || true
           fi
           if [ "$FENGCHI_OK" = true ]; then
+            grep -n 'CONFIG_HMBIRD' arch/arm64/configs/gki_defconfig 2>/dev/null | head -n 3 || true
+            grep -n 'hmbird_free' kernel/fork.c 2>/dev/null | head -n 2 || true
+            echo "✅ HMBIRD Fengchi applied"
             echo "hmbird|applied" >> "$PS_FILE"
           else
             echo "hmbird|failed" >> "$PS_FILE"
@@ -2267,7 +2395,7 @@ runs:
           fi
         done
         ccache --set-config=extra_files_to_hash="$copied_modules"
-        echo "module overlay applied"
+        echo "✅ module overlay applied"
         echo "::endgroup::"
     - name: Apply optimized_mem_operations patch
       shell: bash
@@ -2542,6 +2670,7 @@ runs:
         gen_patch ntsync "$NTSYNC_FOLDER/ntsync_base.patch" "" "g:drivers/misc/ntsync.c|ntsync_misc"
         if grep -Eq '^ntsync\|(applied|already)$' "$PS_FILE"; then
           printf '%s\n' 'CONFIG_NTSYNC=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+          grep -n '^CONFIG_NTSYNC=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
           echo "✅ NTSync patch applied"
         fi
         echo "::endgroup::"
@@ -2572,6 +2701,9 @@ runs:
         fi
         echo "Using patch: $(basename "$UNICODE_PATCH")"
         gen_patch unicode "$UNICODE_PATCH"
+        if grep -Eq '^unicode\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "✅ Unicode fix applied"
+        fi
         echo "::endgroup::"
 
     - name: Add Tmpfs Support
@@ -2597,7 +2729,15 @@ runs:
         CONFIG_NET_SCH_FQ=y
         CONFIG_NET_SCH_FQ_CODEL=y
         EOF
-        echo "bbr|applied" >> "$PS_FILE"
+        if [ -f "$COMMON_KERNEL_FOLDER/net/ipv4/tcp_bbr.c" ] && \
+           grep -q 'config TCP_CONG_BBR' "$COMMON_KERNEL_FOLDER/net/ipv4/Kconfig"; then
+          grep -nE '^CONFIG_(TCP_CONG_BBR|NET_SCH_FQ)=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || true
+          echo "✅ BBR congestion control enabled"
+          echo "bbr|applied" >> "$PS_FILE"
+        else
+          echo "::warning::BBR not available in tree (tcp_bbr.c/Kconfig missing); marking failed"
+          echo "bbr|failed" >> "$PS_FILE"
+        fi
 
     - name: Apply BBRv3
       shell: bash
@@ -2652,7 +2792,7 @@ runs:
         grep -n 'CONFIG_TCP_CONG_BBR' arch/arm64/configs/gki_defconfig
         echo "BBR3_APPLIED=true" >> "$GITHUB_ENV"
         echo "BBR3_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/common/bbrv3" >> "$GITHUB_ENV"
-        echo "BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "✅ BBRv3 applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
 
     - name: Apply BoRE
@@ -2663,22 +2803,39 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         BORE_PATCH="bore_${KERNEL_VER}.patch"
-        if ! fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+        case "$KERNEL_VER" in
+          6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
+          *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
+        esac
+        BORE_PRIMARY=""
+        if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+          BORE_PRIMARY="/tmp/bore.patch"
+        else
+          echo "::warning::BoRE latest upstream unavailable (${BORE_PATCH})"
+        fi
+        # Pinned regen fallback: pre-ported BoRE patches live in scripts/patches,
+        # keyed by kernel version (bore_<ver>_oneplus_regen.patch). Only versions
+        # with a committed override use this fallback; 6.12 ships one today.
+        BORE_FB="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
+        [ -f "$BORE_FB" ] || BORE_FB=""
+        if [ -z "$BORE_PRIMARY" ] && [ -z "$BORE_FB" ]; then
           echo "::warning::BoRE patch unavailable (${BORE_PATCH}); skipping"
           echo "bore|skipped" >> "$PS_FILE"
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
         fi
-        case "$KERNEL_VER" in
-          6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
-          *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
-        esac
-        gen_patch bore /tmp/bore.patch "" "$BORE_SPEC"
-        if ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+        gen_patch_fb bore "$BORE_PRIMARY" "$BORE_FB" "" "$BORE_SPEC" || true
+        if [ "${GEN_PATCH_FB_VIA:-none}" = "none" ] || ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
+        fi
+        if [ "$GEN_PATCH_FB_VIA" = "fallback" ]; then
+          echo "[patchgen] bore: landed via pinned regen fallback ($(basename "$BORE_FB"))"
+          echo "BORE_VIA=pinned-regen-fallback" >> "$GITHUB_ENV"
+        else
+          echo "BORE_VIA=latest-upstream" >> "$GITHUB_ENV"
         fi
         grep -q 'config SCHED_BORE' init/Kconfig
         grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
@@ -2686,7 +2843,7 @@ runs:
         grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
         echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
         echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
-        echo "BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
+        echo "✅ BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
 
     - name: Add TTL Target Support
@@ -2700,7 +2857,15 @@ runs:
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
-        echo "ttl|applied" >> "$PS_FILE"
+        if grep -q 'config IP_NF_TARGET_TTL' "$COMMON_KERNEL_FOLDER/net/ipv4/netfilter/Kconfig" && \
+           grep -q 'config IP6_NF_TARGET_HL' "$COMMON_KERNEL_FOLDER/net/ipv6/netfilter/Kconfig"; then
+          grep -nE '^CONFIG_(IP_NF_TARGET_TTL|IP6_NF_(TARGET_HL|MATCH_HL))=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || true
+          echo "✅ TTL/HL target support enabled"
+          echo "ttl|applied" >> "$PS_FILE"
+        else
+          echo "::warning::TTL/HL targets unavailable in tree; marking failed"
+          echo "ttl|failed" >> "$PS_FILE"
+        fi
 
     - name: Add IP SET & IPv6_NAT Support
       if: ${{ env.OP_IP_SET == 'true' }}
@@ -2747,6 +2912,8 @@ runs:
         gen_patch ipv6-nat "$KERNEL_PATCHES_FOLDER/common/IPv6_NAT_FIX.patch" "" "g:kernel/Makefile|IP6_NF_NAT"
         if grep -Eq '^ipv6-nat\|(applied|already)$' "$PS_FILE"; then
           echo "ip_set|applied" >> "$PS_FILE"
+          grep -nE '^CONFIG_(IP_SET=|IP6_NF_NAT=|NETFILTER_XT_SET=)' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 5 || true
+          echo "✅ IP SET & IPv6 NAT support enabled"
         else
           echo "ip_set|failed" >> "$PS_FILE"
         fi

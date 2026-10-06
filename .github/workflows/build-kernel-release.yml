@@ -657,6 +657,13 @@ jobs:
             fi
             echo "📌 Explicit NoMount commit: $commit"
             src="explicit-commit"
+            head_now="$(gh api "repos/maxsteeel/nomount/branches/$branch" --jq '.commit.sha' 2>/dev/null || true)"
+            if [ -z "$head_now" ]; then
+              head_now="$(git ls-remote "https://github.com/maxsteeel/nomount.git" "refs/heads/$branch" 2>/dev/null | cut -f1 || true)"
+            fi
+            if [ -n "$head_now" ] && [ "$commit" != "$head_now" ]; then
+              echo "::warning::Pinned NoMount commit ${commit:0:7} is not HEAD (${head_now:0:7}) of branch '$branch'. If you did not intend a rollback, clear the pre-filled nomount_commit field in the dispatch form and re-run."
+            fi
             if find_module_for "$commit"; then
               module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
               echo "✅ Exact CI-built module found: $module_name (informational — the module is built from source in this run)"
@@ -664,23 +671,22 @@ jobs:
               echo "::warning::No live NoMount module artifact for commit $commit — the module will be built from source in this run instead."
             fi
           else
-            # ── Mode 2: auto — newest commit on <branch> whose own CI built a module ──
-            mapfile -t candidates < <(gh api "repos/maxsteeel/nomount/actions/runs?branch=$branch&status=success&per_page=20" \
-              --jq '[.workflow_runs[] | select(.path | endswith("build.yml"))][0:10][].head_sha' 2>/dev/null || true)
-            for sha in "${candidates[@]:-}"; do
-              [ -z "$sha" ] && continue
-              commit="$sha"
-              src="latest-ci-success-$branch"
-              echo "🔀 Latest CI-successful commit on '$branch': $commit"
-              if find_module_for "$sha"; then
-                module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
-                echo "   Upstream CI module (informational): $module_name"
-              fi
-              break
-            done
+            # ── Mode 2: auto — absolute HEAD of <branch> on maxsteeel/nomount ──
+            commit="$(gh api "repos/maxsteeel/nomount/branches/$branch" --jq '.commit.sha' 2>/dev/null || true)"
             if [ -z "$commit" ]; then
-              echo "::error::No CI-verified NoMount commit found on branch '$branch' and no explicit commit was provided"
+              commit="$(git ls-remote "https://github.com/maxsteeel/nomount.git" "refs/heads/$branch" 2>/dev/null | cut -f1 || true)"
+            fi
+            if [ -z "$commit" ]; then
+              echo "::error::Could not resolve HEAD of branch '$branch' on maxsteeel/nomount (API and ls-remote both failed)"
               exit 1
+            fi
+            src="branch-head-$branch"
+            echo "🔀 HEAD of '$branch': $commit"
+            if find_module_for "$commit"; then
+              module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
+              echo "   Upstream CI module (informational): $module_name"
+            else
+              echo "   No upstream CI module for HEAD yet — the module will be built from source in this run"
             fi
           fi
 
